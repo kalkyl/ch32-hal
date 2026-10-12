@@ -43,6 +43,9 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
     }
 }
 
+mod slave;
+pub use slave::{Half, SlaveConfig, SlaveError, SpiSlaveRing};
+
 /// SPI Error
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
