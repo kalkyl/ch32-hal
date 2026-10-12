@@ -86,6 +86,10 @@ pub struct SpiSlaveRing<'d, T: Instance, W: Word> {
     _phantom: PhantomData<&'d mut [W]>,
 }
 
+// SAFETY: the buffers are borrowed exclusively for 'd; the raw pointers only avoid aliasing
+// the halves the DMA is using
+unsafe impl<'d, T: Instance, W: Word + Send> Send for SpiSlaveRing<'d, T, W> {}
+
 impl<'d, T: Instance, W: Word> SpiSlaveRing<'d, T, W> {
     /// `rx_buf` and `tx_buf` are the same length; each pass uses 2 x `half_len` words of
     /// them (all of them by default). Nothing runs until [`start`](Self::start).
