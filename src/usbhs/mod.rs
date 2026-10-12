@@ -1,42 +1,41 @@
 //! USBHS device mode peripheral driver
 //! Note that this currently only implements device mode
 //!
-//! <div class="warning">
-//! There's a lot of TODOs and panics where things are not implemented
-//! </div>
+//! Every transfer completes in the interrupt handler: it reads the shared status
+//! (`INT_ST`, `RX_LEN`) and releases `INT_FG` at once -- isochronous transactions ignore
+//! `INT_BUSY` and would overwrite them -- then records the result per endpoint and wakes
+//! the task. Bulk / interrupt endpoints keep flow control by answering NAK until their
+//! task has taken the data (OUT) or loaded the next packet (IN).
 //!
-//! The same endpoint index cannot be used for both In/Out transfers.
-//! This is a limitation of the implementation and should be fixed.
+//! Isochronous endpoints run without a task in the loop:
+//! - OUT: a ring of [`ISO_OUT_SLOTS`] packet buffers. The interrupt points the endpoint's
+//!   DMA at the next free slot after each packet; `read` drains the ring. A full ring
+//!   drops the newest packet.
+//! - IN: a ring of [`ISO_IN_SLOTS`] packets. After each IN transaction the interrupt
+//!   loads the next queued packet, or a zero-length one when none is queued. `write`
+//!   waits for a free slot, so a writer keeps the ring full and stays at most
+//!   [`ISO_IN_SLOTS`] packets ahead; [`iso_in_prime`] queues from an interrupt (e.g. an
+//!   explicit feedback value from the SOF callback).
+//! - Each slot is one endpoint buffer from the driver's buffer array, so the array needs
+//!   room for the rings: one buffer for EP0 and each bulk / interrupt endpoint, plus
+//!   [`ISO_OUT_SLOTS`] per isochronous OUT and [`ISO_IN_SLOTS`] per isochronous IN.
 //!
-//! List of things that is tested
-//! Untested but expected to work items are noted as well
+//! [`set_sof_callback`] runs a function from the interrupt on every SOF (125 us at high
+//! speed).
 //!
-//! Control Pipe:
-//! - [x] Receive `SETUP` packet (Host -> Dev)
-//! - [x] Send `IN` packet (Dev -> Host).
-//! - [x] Receive `OUT` packet (Host -> Dev).
+//! An endpoint number can be used for both an IN and an OUT endpoint.
 //!
-//! Other Endpoints:
-//! - [x] Interrupt Out
-//! - [x] Interrupt In
-//! - [ ] Bulk Out (Expected to work but not tested)
-//! - [ ] Bulk In (Expected to work but not tested)
-//! - [ ] Isochronous Out (Does not work)
-//! - [ ] Isochronous In (Does not work)
-//!
-//! Other Features:
-//! - [ ] Set endpoint stall
-//! - [ ] Get endpoint stall status
-//! - [ ] Remote wakeup
-//!
+//! Not supported: remote wakeup, high-bandwidth isochronous (more than one transaction per
+//! microframe), hardware double buffering.
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use bitmaps::Bitmap;
 use ch32_metapac::usbhs::regs::{EpBufMod, EpConfig, EpType};
-use ch32_metapac::usbhs::vals::{EpRxResponse, EpTog, EpTxResponse, SpeedType, UsbToken};
+use ch32_metapac::usbhs::vals::{EndpointType as EpKind, EpRxResponse, EpTog, EpTxResponse, SpeedType, UsbToken};
 use control::ControlPipe;
 use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::{
@@ -46,7 +45,7 @@ use endpoint::Endpoint;
 
 use crate::gpio::{AFType, Speed};
 use crate::interrupt::typelevel::Interrupt;
-use crate::usb::{Dir, EndpointBufferAllocator, EndpointData, EndpointDataBuffer, In, Out};
+use crate::usb::{Dir, EndpointBufferAllocator, EndpointDataBuffer, In, Out};
 use crate::{interrupt, Peri, PeripheralType};
 
 pub mod control;
@@ -55,9 +54,181 @@ mod endpoint;
 const MAX_NR_EP: usize = 16;
 const EP_MAX_PACKET_SIZE: u16 = 64;
 
-const NEW_AW: AtomicWaker = AtomicWaker::new();
-static BUS_WAKER: AtomicWaker = NEW_AW;
-static EP_WAKERS: [AtomicWaker; MAX_NR_EP] = [NEW_AW; MAX_NR_EP];
+/// Packet buffers per isochronous OUT endpoint (15 packets can wait for the task).
+pub const ISO_OUT_SLOTS: usize = 16;
+/// Packets queued per isochronous IN endpoint.
+pub const ISO_IN_SLOTS: usize = 2;
+
+/// The isochronous IN response: "data ready" (TinyUSB `USBHS_EP_T_RES_NYET`).
+const TX_RES_ISO: EpTxResponse = EpTxResponse::_RESERVED_1;
+
+static BUS_WAKER: AtomicWaker = AtomicWaker::new();
+
+/// Per endpoint and direction, shared between the interrupt and the endpoint's task.
+pub(crate) struct EpState {
+    pub(crate) waker: AtomicWaker,
+    /// bulk / interrupt / control: OUT -- a packet of `len` bytes is in the buffer; IN --
+    /// the loaded packet went out
+    pub(crate) ready: AtomicBool,
+    pub(crate) len: AtomicU16,
+    /// OUT: a read is waiting (the endpoint answers ACK)
+    pub(crate) armed: AtomicBool,
+    pub(crate) iso: AtomicBool,
+    // isochronous ring: slot i at base + (i % slots) * stride; [tail, head) hold packets
+    pub(crate) base: AtomicU32,
+    pub(crate) stride: AtomicU16,
+    pub(crate) slots: AtomicU8,
+    pub(crate) head: AtomicU8,
+    pub(crate) tail: AtomicU8,
+    /// IN: slot `tail` is loaded in the endpoint (else a zero-length packet is)
+    pub(crate) loaded: AtomicBool,
+    pub(crate) lens: [AtomicU16; ISO_OUT_SLOTS],
+    /// OUT: packets dropped on a full ring
+    pub(crate) overruns: AtomicU32,
+}
+
+impl EpState {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const NEW: Self = Self {
+        waker: AtomicWaker::new(),
+        ready: AtomicBool::new(false),
+        len: AtomicU16::new(0),
+        armed: AtomicBool::new(false),
+        iso: AtomicBool::new(false),
+        base: AtomicU32::new(0),
+        stride: AtomicU16::new(0),
+        slots: AtomicU8::new(1),
+        head: AtomicU8::new(0),
+        tail: AtomicU8::new(0),
+        loaded: AtomicBool::new(false),
+        lens: [const { AtomicU16::new(0) }; ISO_OUT_SLOTS],
+        overruns: AtomicU32::new(0),
+    };
+
+    fn reset(&self) {
+        self.ready.store(false, Ordering::Relaxed);
+        self.armed.store(false, Ordering::Relaxed);
+        self.head.store(0, Ordering::Relaxed);
+        self.tail.store(0, Ordering::Relaxed);
+        self.loaded.store(false, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count(&self) -> u8 {
+        self.head
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.tail.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn slot_addr(&self, i: u8) -> u32 {
+        let n = self.slots.load(Ordering::Relaxed);
+        self.base.load(Ordering::Relaxed) + (i % n) as u32 * self.stride.load(Ordering::Relaxed) as u32
+    }
+}
+
+pub(crate) static OUT_STATE: [EpState; MAX_NR_EP] = [EpState::NEW; MAX_NR_EP];
+pub(crate) static IN_STATE: [EpState; MAX_NR_EP] = [EpState::NEW; MAX_NR_EP];
+
+/// The setup packet, copied out of the EP0 buffer by the interrupt.
+static SETUP: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+static SETUP_READY: AtomicBool = AtomicBool::new(false);
+
+/// The peripheral's base address, for the free functions (0 until a driver exists).
+static REGS: AtomicUsize = AtomicUsize::new(0);
+static SOF_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+
+fn dregs() -> Option<crate::pac::usbhs::Usbd> {
+    match REGS.load(Ordering::Acquire) {
+        0 => None,
+        a => Some(unsafe { crate::pac::usbhs::Usbd::from_ptr(a as _) }),
+    }
+}
+
+/// Call `f` from the USB interrupt on every SOF (every 125 us microframe at high speed).
+/// Keep it short: it delays every other USB completion.
+pub fn set_sof_callback(f: fn()) {
+    SOF_CALLBACK.store(f as usize, Ordering::Release);
+    if let Some(d) = dregs() {
+        critical_section::with(|_| d.int_en().modify(|w| w.set_sof_act(true)));
+    }
+}
+
+/// Packets queued on isochronous IN endpoint `ep` and not yet taken by the host
+/// (including the one loaded in the endpoint).
+pub fn iso_in_pending(ep: usize) -> u8 {
+    IN_STATE[ep].count()
+}
+
+/// Queue one packet on isochronous IN endpoint `ep`; callable from interrupts. `false`:
+/// not queued (ring full, endpoint not enabled or not isochronous, packet too long).
+pub fn iso_in_prime(ep: usize, data: &[u8]) -> bool {
+    let Some(d) = dregs() else { return false };
+    if ep == 0 || ep >= MAX_NR_EP || !d.ep_config().read().t_en(ep - 1) {
+        return false;
+    }
+    iso_in_enqueue(d, ep, data)
+}
+
+/// Copy `data` into the next free slot and publish it; loads it at once if the endpoint
+/// has nothing loaded. The slot at `head` is never touched by the interrupt, so the copy
+/// runs outside the critical section. One producer per endpoint.
+pub(crate) fn iso_in_enqueue(d: crate::pac::usbhs::Usbd, ep: usize, data: &[u8]) -> bool {
+    let s = &IN_STATE[ep];
+    let n = s.slots.load(Ordering::Relaxed);
+    if !s.iso.load(Ordering::Relaxed) || data.len() > s.stride.load(Ordering::Relaxed) as usize || s.count() >= n {
+        return false;
+    }
+    let head = s.head.load(Ordering::Relaxed);
+    // SAFETY: the slot is inside the ring's buffers and not in [tail, head)
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), s.slot_addr(head) as *mut u8, data.len()) };
+    s.lens[(head % n) as usize].store(data.len() as u16, Ordering::Relaxed);
+    critical_section::with(|_| {
+        s.head.store(head.wrapping_add(1), Ordering::Release);
+        if !s.loaded.load(Ordering::Relaxed) {
+            iso_in_load(d, ep);
+        }
+    });
+    true
+}
+
+/// Load slot `tail` into the endpoint, or a zero-length packet if the ring is empty.
+/// Interrupt or critical section only.
+///
+/// Loading while the endpoint is already answering an IN with the zero-length packet
+/// (the ring ran empty) can't be told apart from the packet going out: that one packet is
+/// lost. A writer that keeps the ring full doesn't run into it.
+fn iso_in_load(d: crate::pac::usbhs::Usbd, ep: usize) {
+    let s = &IN_STATE[ep];
+    if s.count() > 0 {
+        let tail = s.tail.load(Ordering::Relaxed);
+        let n = s.slots.load(Ordering::Relaxed);
+        d.ep_tx_dma(ep - 1).write_value(s.slot_addr(tail));
+        d.ep_t_len(ep)
+            .write(|w| w.set_len(s.lens[(tail % n) as usize].load(Ordering::Relaxed)));
+        s.loaded.store(true, Ordering::Relaxed);
+    } else {
+        d.ep_t_len(ep).write(|w| w.set_len(0));
+        s.loaded.store(false, Ordering::Relaxed);
+    }
+}
+
+/// The setup packet, if one arrived since the last call.
+pub(crate) fn take_setup() -> Option<[u8; 8]> {
+    critical_section::with(|_| {
+        if SETUP_READY.load(Ordering::Acquire) {
+            SETUP_READY.store(false, Ordering::Release);
+            let a = SETUP[0].load(Ordering::Relaxed).to_le_bytes();
+            let b = SETUP[1].load(Ordering::Relaxed).to_le_bytes();
+            Some([a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]])
+        } else {
+            None
+        }
+    })
+}
+
+/// A setup packet arrived and ends whatever control transfer EP0 was in.
+pub(crate) fn setup_pending() -> bool {
+    SETUP_READY.load(Ordering::Acquire)
+}
 
 pub struct InterruptHandler<T: Instance> {
     _phantom: PhantomData<T>,
@@ -66,9 +237,8 @@ pub struct InterruptHandler<T: Instance> {
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         let r = T::regs();
+        let d = T::dregs();
         let flag = r.int_fg().read();
-
-        assert!(!flag.fifo_ov());
 
         if flag.bus_rst() {
             //mask the interrupt and let the main thread handle it
@@ -80,37 +250,118 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             r.int_en().modify(|w| w.set_suspend(false));
             BUS_WAKER.wake();
         };
-        if flag.setup_act() {
-            //mask the interrupt and let the main thread handle it
-            r.int_en().modify(|w| w.set_setup_act(false));
-            EP_WAKERS[0].wake();
-        };
-        if flag.transfer() {
-            let status = r.int_st().read();
-
-            match status.token() {
-                UsbToken::OUT => {
-                    if status.tog_ok() {
-                        EP_WAKERS[status.endp() as usize].wake();
-                        r.int_en().modify(|w| w.set_transfer(false));
-                    } else {
-                        // If `tog` is wrong, keep NAK and wait for a "resend"
-                        r.int_fg().write(|v| v.set_transfer(true));
-                    }
-                }
-                UsbToken::IN => {
-                    EP_WAKERS[status.endp() as usize].wake();
-                    r.int_en().modify(|w| w.set_transfer(false));
-                }
-                // SETUP
-                t @ (UsbToken::SOF | UsbToken::SETUP) => {
-                    panic!("received token {}", t as u8)
-                }
-            }
+        if flag.fifo_ov() {
+            r.int_fg().write(|w| w.set_fifo_ov(true));
         }
         if flag.hst_sof() {
-            r.int_fg().write(|v| v.set_hst_sof(true));
+            r.int_fg().write(|w| w.set_hst_sof(true));
         }
+
+        if flag.transfer() {
+            let st = r.int_st().read();
+            let len = r.rx_len().read();
+            let ep = st.endp() as usize;
+            let token = st.token();
+
+            let iso = match token {
+                UsbToken::OUT => OUT_STATE[ep].iso.load(Ordering::Relaxed),
+                UsbToken::IN => IN_STATE[ep].iso.load(Ordering::Relaxed),
+                _ => true,
+            };
+            // bulk / interrupt / control: NAK before releasing the flag, so the next
+            // transaction waits for the task
+            if !iso {
+                match token {
+                    UsbToken::OUT if st.tog_ok() => {
+                        d.ep_rx_ctrl(ep).modify(|w| w.set_mask_uep_r_res(EpRxResponse::NAK))
+                    }
+                    UsbToken::IN => d.ep_tx_ctrl(ep).modify(|w| w.set_mask_uep_t_res(EpTxResponse::NAK)),
+                    _ => {}
+                }
+            }
+            // release early: INT_ST / RX_LEN are read
+            r.int_fg().write(|w| w.set_transfer(true));
+
+            match token {
+                UsbToken::SOF => {
+                    let f = SOF_CALLBACK.load(Ordering::Acquire);
+                    if f != 0 {
+                        let f: fn() = core::mem::transmute(f);
+                        f();
+                    }
+                }
+                // a wrong toggle: a retransmit (lost ACK), dropped; the endpoint stays armed
+                UsbToken::OUT if !st.tog_ok() => {}
+                UsbToken::OUT if iso => {
+                    let s = &OUT_STATE[ep];
+                    let n = s.slots.load(Ordering::Relaxed);
+                    let mut head = s.head.load(Ordering::Relaxed);
+                    if head.wrapping_sub(s.tail.load(Ordering::Acquire)) < n - 1 {
+                        s.lens[(head % n) as usize].store(len, Ordering::Relaxed);
+                        head = head.wrapping_add(1);
+                        s.head.store(head, Ordering::Release);
+                    } else {
+                        // full: the next packet overwrites this slot
+                        s.overruns
+                            .store(s.overruns.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+                    }
+                    d.ep_rx_dma(ep - 1).write_value(s.slot_addr(head));
+                    s.waker.wake();
+                }
+                UsbToken::OUT => {
+                    let s = &OUT_STATE[ep];
+                    if ep == 0 {
+                        d.ep_rx_ctrl(0)
+                            .modify(|w| w.set_mask_uep_r_tog(flip(w.mask_uep_r_tog())));
+                    }
+                    s.len.store(len, Ordering::Relaxed);
+                    s.armed.store(false, Ordering::Relaxed);
+                    s.ready.store(true, Ordering::Release);
+                    s.waker.wake();
+                }
+                UsbToken::IN if iso => {
+                    let s = &IN_STATE[ep];
+                    if s.loaded.load(Ordering::Relaxed) {
+                        s.tail
+                            .store(s.tail.load(Ordering::Relaxed).wrapping_add(1), Ordering::Release);
+                    }
+                    iso_in_load(d, ep);
+                    s.waker.wake();
+                }
+                UsbToken::IN => {
+                    let s = &IN_STATE[ep];
+                    if ep == 0 {
+                        d.ep_tx_ctrl(0)
+                            .modify(|w| w.set_mask_uep_t_tog(flip(w.mask_uep_t_tog())));
+                    }
+                    s.ready.store(true, Ordering::Release);
+                    s.waker.wake();
+                }
+                UsbToken::SETUP => {}
+            }
+        }
+
+        if flag.setup_act() {
+            // a new control transfer: whatever EP0 was doing is over
+            d.ep_rx_ctrl(0).write(|w| w.set_mask_uep_r_res(EpRxResponse::NAK));
+            d.ep_tx_ctrl(0).write(|w| w.set_mask_uep_t_res(EpTxResponse::NAK));
+            let buf = d.ep0_dma().read() as *const u32;
+            SETUP[0].store(core::ptr::read_volatile(buf), Ordering::Relaxed);
+            SETUP[1].store(core::ptr::read_volatile(buf.add(1)), Ordering::Relaxed);
+            OUT_STATE[0].ready.store(false, Ordering::Relaxed);
+            IN_STATE[0].ready.store(false, Ordering::Relaxed);
+            SETUP_READY.store(true, Ordering::Release);
+            r.int_fg().write(|w| w.set_setup_act(true));
+            OUT_STATE[0].waker.wake();
+            IN_STATE[0].waker.wake();
+        }
+    }
+}
+
+fn flip(t: EpTog) -> EpTog {
+    match t {
+        EpTog::DATA0 => EpTog::DATA1,
+        _ => EpTog::DATA0,
     }
 }
 
@@ -120,17 +371,21 @@ pub struct WakeupInterruptHandler<T: Instance> {
 
 impl<T: Instance> interrupt::typelevel::Handler<T::WakeupInterrupt> for WakeupInterruptHandler<T> {
     unsafe fn on_interrupt() {
-        todo!()
+        // not used by this driver (resume shows up through the SUSPEND flag)
+        T::WakeupInterrupt::disable();
     }
 }
 
 pub struct Driver<'d, T: Instance, const NR_EP: usize, const SIZE: usize> {
     phantom: PhantomData<&'d T>,
     allocator: EndpointBufferAllocator<'d, NR_EP, SIZE>,
-    allocated: Bitmap<MAX_NR_EP>,
+    allocated_in: Bitmap<MAX_NR_EP>,
+    allocated_out: Bitmap<MAX_NR_EP>,
 }
 
 impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP, SIZE> {
+    /// `ep_buffer`: one buffer for EP0 and each bulk / interrupt endpoint, plus the
+    /// isochronous rings ([`ISO_OUT_SLOTS`] / [`ISO_IN_SLOTS`] buffers each).
     pub fn new(
         _peri: Peri<'d, T>,
         _irqs: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>>
@@ -171,6 +426,13 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
             w.set_speed_type(SpeedType::HIGHSPEED);
         });
 
+        for s in OUT_STATE.iter().chain(IN_STATE.iter()) {
+            s.reset();
+            s.iso.store(false, Ordering::Relaxed);
+        }
+        SETUP_READY.store(false, Ordering::Relaxed);
+        REGS.store(r.as_ptr() as usize, Ordering::Release);
+
         r.int_en().write(|w| {
             w.set_dev_nak(false);
             w.set_fifo_ov(true);
@@ -178,18 +440,15 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
             w.set_suspend(true);
             w.set_bus_rst(true);
             w.set_transfer(true);
+            w.set_sof_act(SOF_CALLBACK.load(Ordering::Relaxed) != 0);
         });
 
         Self {
             phantom: PhantomData,
             allocator,
-            allocated: Bitmap::new(),
+            allocated_in: Bitmap::new(),
+            allocated_out: Bitmap::new(),
         }
-    }
-
-    fn find_free_ep_address(&self, _dir: Direction) -> Result<u8, EndpointAllocError> {
-        // Skip index 0 which is reserved for control endpoint
-        Ok(self.allocated.next_false_index(0).ok_or(EndpointAllocError)? as u8)
     }
 
     fn alloc_endpoint<D: Dir>(
@@ -200,6 +459,10 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
         interval_ms: u8,
         dir: Direction,
     ) -> Result<Endpoint<'d, T, D, SIZE>, EndpointAllocError> {
+        let allocated = match dir {
+            Direction::Out => &mut self.allocated_out,
+            Direction::In => &mut self.allocated_in,
+        };
         let addr = match ep_addr {
             Some(addr) => {
                 // Use the provided endpoint address
@@ -208,31 +471,39 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
                 }
 
                 let ep_num = addr.index();
-                if ep_num >= MAX_NR_EP {
+                if ep_num == 0 || ep_num >= MAX_NR_EP || allocated.get(ep_num) {
                     return Err(EndpointAllocError);
                 }
 
-                // Check if this endpoint is already allocated
-                if self.allocated.get(ep_num) {
-                    return Err(EndpointAllocError);
-                }
-
-                self.allocated.set(ep_num, true);
+                allocated.set(ep_num, true);
                 addr
             }
             None => {
-                // Find a free endpoint address
-                let ep_addr = self.find_free_ep_address(dir)?;
-                let addr = EndpointAddress::from_parts(ep_addr as usize, dir);
-
-                // Mark as allocated
-                self.allocated.set(ep_addr as usize, true);
-
-                addr
+                // Find a free endpoint address; index 0 is the control endpoint
+                let ep_num = allocated.next_false_index(0).ok_or(EndpointAllocError)?;
+                allocated.set(ep_num, true);
+                EndpointAddress::from_parts(ep_num, dir)
             }
         };
 
+        let iso = ep_type == EndpointType::Isochronous;
+        let slots = match (iso, dir) {
+            (false, _) => 1,
+            (true, Direction::Out) => ISO_OUT_SLOTS,
+            (true, Direction::In) => ISO_IN_SLOTS,
+        };
+        // the ring's slots are consecutive buffers of the array
         let data = self.allocator.alloc_endpoint(max_packet_size)?;
+        for _ in 1..slots {
+            self.allocator.alloc_endpoint(max_packet_size)?;
+        }
+
+        let s = state(addr);
+        s.iso.store(iso, Ordering::Relaxed);
+        s.base.store(data.addr() as u32, Ordering::Relaxed);
+        s.stride.store(SIZE as u16, Ordering::Relaxed);
+        s.slots.store(slots as u8, Ordering::Relaxed);
+        s.reset();
 
         Ok(Endpoint::new(
             EndpointInfo {
@@ -243,6 +514,13 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
             },
             data,
         ))
+    }
+}
+
+pub(crate) fn state(addr: EndpointAddress) -> &'static EpState {
+    match addr.direction() {
+        Direction::Out => &OUT_STATE[addr.index()],
+        Direction::In => &IN_STATE[addr.index()],
     }
 }
 
@@ -319,26 +597,36 @@ impl<'d, T: Instance> Bus<'d, T> {
         let regs = T::regs();
         let d = T::dregs();
 
-        // Reset device address
-        regs.dev_ad().write(|v| {
-            v.set_addr(0);
+        critical_section::with(|_| {
+            // Reset device address
+            regs.dev_ad().write(|v| {
+                v.set_addr(0);
+            });
+
+            // Reset endpoint state on bus reset
+            // EP0 get ACK/NAK so it can recieve setup
+            d.ep_rx_ctrl(0).write(|v| v.set_mask_uep_r_res(EpRxResponse::ACK));
+            d.ep_tx_ctrl(0).write(|v| v.set_mask_uep_t_res(EpTxResponse::NAK));
+
+            // Mark all other EPs as NAK
+            for i in 1..=15 {
+                d.ep_tx_ctrl(i).write(|v| v.set_mask_uep_t_res(EpTxResponse::NAK));
+                d.ep_rx_ctrl(i).write(|v| v.set_mask_uep_r_res(EpRxResponse::NAK));
+            }
+
+            // Disable all endpoints [1, 15]
+            d.ep_config().write_value(EpConfig::default());
+            d.ep_type().write_value(EpType::default());
+            d.ep_buf_mod().write_value(EpBufMod::default());
+
+            for s in OUT_STATE.iter().chain(IN_STATE.iter()) {
+                s.reset();
+            }
+            SETUP_READY.store(false, Ordering::Relaxed);
         });
-
-        // Reset endpoint state on bus reset
-        // EP0 get ACK/NAK so it can recieve setup
-        d.ep_rx_ctrl(0).write(|v| v.set_mask_uep_r_res(EpRxResponse::ACK));
-        d.ep_tx_ctrl(0).write(|v| v.set_mask_uep_t_res(EpTxResponse::NAK));
-
-        // Mark all other EPs as NAK
-        for i in 1..=15 {
-            d.ep_tx_ctrl(i).write(|v| v.set_mask_uep_t_res(EpTxResponse::NAK));
-            d.ep_rx_ctrl(i).write(|v| v.set_mask_uep_r_res(EpRxResponse::NAK));
+        for s in OUT_STATE.iter().chain(IN_STATE.iter()) {
+            s.waker.wake();
         }
-
-        // Disable all endpoints [1, 15]
-        d.ep_config().write_value(EpConfig::default());
-        d.ep_type().write_value(EpType::default());
-        d.ep_buf_mod().write_value(EpBufMod::default());
     }
 }
 
@@ -388,38 +676,99 @@ impl<'d, T: Instance> embassy_usb_driver::Bus for Bus<'d, T> {
 
     fn endpoint_set_enabled(&mut self, ep_addr: EndpointAddress, enabled: bool) {
         let index = ep_addr.index();
+        if index == 0 {
+            return;
+        }
+        let d = T::dregs();
+        let s = state(ep_addr);
+        let iso = s.iso.load(Ordering::Relaxed);
+        let kind = if iso && enabled { EpKind::ISO } else { EpKind::NISO };
 
-        critical_section::with(|_| match ep_addr.direction() {
-            Direction::Out => {
-                T::dregs().ep_config().modify(|v| v.set_r_en(index - 1, enabled));
-                T::dregs().ep_rx_ctrl(index).write(|v| {
-                    v.set_mask_uep_r_tog(EpTog::DATA0);
-                    v.set_mask_uep_r_res(EpRxResponse::NAK);
-                    v.set_r_tog_auto(false);
-                });
-            }
-            Direction::In => {
-                T::dregs().ep_config().modify(|v| v.set_t_en(index - 1, enabled));
-                T::dregs().ep_tx_ctrl(index).write(|v| {
-                    v.set_mask_uep_t_tog(EpTog::DATA0);
-                    v.set_mask_uep_t_res(EpTxResponse::NAK);
-                    v.set_t_tog_auto(false);
-                });
+        critical_section::with(|_| {
+            s.reset();
+            match ep_addr.direction() {
+                Direction::Out => {
+                    d.ep_rx_dma(index - 1).write_value(s.slot_addr(0));
+                    d.ep_rx_ctrl(index).write(|v| {
+                        v.set_mask_uep_r_tog(EpTog::DATA0);
+                        v.set_mask_uep_r_res(if iso && enabled {
+                            EpRxResponse::NYET // isochronous: armed, no handshake
+                        } else {
+                            EpRxResponse::NAK
+                        });
+                        v.set_r_tog_auto(!iso);
+                    });
+                    d.ep_type().modify(|v| v.set_r_type(index - 1, kind));
+                    d.ep_config().modify(|v| v.set_r_en(index - 1, enabled));
+                }
+                Direction::In => {
+                    d.ep_tx_dma(index - 1).write_value(s.slot_addr(0));
+                    d.ep_t_len(index).write(|v| v.set_len(0));
+                    d.ep_tx_ctrl(index).write(|v| {
+                        v.set_mask_uep_t_tog(EpTog::DATA0);
+                        // isochronous: answers every IN, with a zero-length packet when
+                        // nothing is queued
+                        v.set_mask_uep_t_res(if iso && enabled { TX_RES_ISO } else { EpTxResponse::NAK });
+                        v.set_t_tog_auto(!iso);
+                    });
+                    d.ep_type().modify(|v| v.set_t_type(index - 1, kind));
+                    d.ep_config().modify(|v| v.set_t_en(index - 1, enabled));
+                }
             }
         });
-        EP_WAKERS[ep_addr.index()].wake();
+        s.waker.wake();
     }
 
-    fn endpoint_set_stalled(&mut self, _ep_addr: EndpointAddress, _stalled: bool) {
-        todo!()
+    fn endpoint_set_stalled(&mut self, ep_addr: EndpointAddress, stalled: bool) {
+        let index = ep_addr.index();
+        let d = T::dregs();
+        let s = state(ep_addr);
+        let iso = s.iso.load(Ordering::Relaxed);
+        critical_section::with(|_| match (ep_addr.direction(), stalled) {
+            (Direction::Out, true) => d
+                .ep_rx_ctrl(index)
+                .modify(|v| v.set_mask_uep_r_res(EpRxResponse::STALL)),
+            (Direction::In, true) => {
+                d.ep_t_len(index).write(|v| v.set_len(0));
+                d.ep_tx_ctrl(index)
+                    .modify(|v| v.set_mask_uep_t_res(EpTxResponse::STALL));
+            }
+            (Direction::Out, false) => d.ep_rx_ctrl(index).write(|v| {
+                // a read still waiting stays armed (or it would NAK forever)
+                v.set_mask_uep_r_res(if iso {
+                    EpRxResponse::NYET
+                } else if s.armed.load(Ordering::Relaxed) {
+                    EpRxResponse::ACK
+                } else {
+                    EpRxResponse::NAK
+                });
+                v.set_mask_uep_r_tog(EpTog::DATA0);
+                v.set_r_tog_auto(index != 0 && !iso);
+            }),
+            (Direction::In, false) => d.ep_tx_ctrl(index).write(|v| {
+                v.set_mask_uep_t_res(if iso { TX_RES_ISO } else { EpTxResponse::NAK });
+                v.set_mask_uep_t_tog(EpTog::DATA0);
+                v.set_t_tog_auto(index != 0 && !iso);
+            }),
+        });
+        if !stalled && ep_addr.direction() == Direction::In && !iso {
+            // a write waiting on the stalled endpoint finishes (its data is dropped)
+            s.ready.store(true, Ordering::Release);
+        }
+        s.waker.wake();
     }
 
-    fn endpoint_is_stalled(&mut self, _ep_addr: EndpointAddress) -> bool {
-        todo!()
+    fn endpoint_is_stalled(&mut self, ep_addr: EndpointAddress) -> bool {
+        let index = ep_addr.index();
+        let d = T::dregs();
+        match ep_addr.direction() {
+            Direction::Out => d.ep_rx_ctrl(index).read().mask_uep_r_res() == EpRxResponse::STALL,
+            Direction::In => d.ep_tx_ctrl(index).read().mask_uep_t_res() == EpTxResponse::STALL,
+        }
     }
 
     async fn remote_wakeup(&mut self) -> Result<(), Unsupported> {
-        todo!()
+        Err(Unsupported)
     }
 }
 
