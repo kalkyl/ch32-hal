@@ -27,6 +27,9 @@ use crate::mode::{Async, Blocking, Mode as PeriMode};
 use crate::time::Hertz;
 use crate::{pac, peripherals, Peri};
 
+mod slave;
+pub use slave::{Half, SlaveConfig, SlaveError, SpiSlaveRing};
+
 /// SPI Error
 #[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
