@@ -67,6 +67,7 @@ impl<'d, T: Instance> RingBufferedUartRx<'d, T> {
     pub fn start_uart(&mut self) {
         // Clear the buffer so that it is ready to receive data
         compiler_fence(Ordering::SeqCst);
+        self.ring_buf.reset();
         self.ring_buf.start();
 
         let r = T::regs();
@@ -89,7 +90,8 @@ impl<'d, T: Instance> RingBufferedUartRx<'d, T> {
 
     /// Stop DMA backed UART receiver
     fn stop_uart(&mut self) {
-        self.ring_buf.request_stop();
+        // paused, not stopped: the next read restarts it after an error
+        self.ring_buf.request_pause();
 
         let r = T::regs();
         // clear all interrupts and DMA Rx Request
@@ -206,6 +208,7 @@ impl<'d, T: Instance> RingBufferedUartRx<'d, T> {
 impl<T: Instance> Drop for RingBufferedUartRx<'_, T> {
     fn drop(&mut self) {
         self.stop_uart();
+        self.ring_buf.request_stop();
         self.rx.as_ref().map(|x| x.set_as_disconnected());
         self.rts.as_ref().map(|x| x.set_as_disconnected());
         T::disable();
