@@ -5,7 +5,7 @@ use core::marker::PhantomData;
 
 use super::low_level::{InputTISelection, Timer};
 use super::{Channel, Channel1Pin, Channel2Pin, GeneralInstance16bit};
-use crate::gpio::{AnyPin, Pull};
+use crate::gpio::{AfType, AnyPin, Pull};
 use crate::pac::timer::vals;
 use crate::Peri;
 
@@ -24,10 +24,13 @@ macro_rules! channel_impl {
     ($new_chx:ident, $channel:ident, $pin_trait:ident) => {
         impl<'d, T: GeneralInstance16bit> QeiPin<'d, T, $channel> {
             #[doc = concat!("Create a new ", stringify!($channel), " encoder input.")]
-            pub fn $new_chx<const REMAP: u8>(pin: Peri<'d, impl $pin_trait<T, REMAP>>, pull: Pull) -> Self {
+            pub fn $new_chx<#[cfg(not(afio_h4))] const REMAP: u8>(
+                pin: Peri<'d, if_remap!(impl $pin_trait<T, REMAP>)>,
+                pull: Pull,
+            ) -> Self {
+                apply_remap!();
                 critical_section::with(|_| {
-                    pin.set_as_input(pull);
-                    T::set_remap(REMAP);
+                    set_as_af!(pin, AfType::input(pull));
                 });
                 QeiPin {
                     _pin: pin.into(),
