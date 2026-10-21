@@ -941,6 +941,13 @@ impl<'a, W: Word> Drop for WritableRingBuffer<'a, W> {
 
 // ==============================
 
+fn remaining(r: pac::dma::Dma, num: usize) -> usize {
+    #[cfg(not(ch32h4))]
+    return r.ch(num).ndtr().read().ndt() as usize;
+    #[cfg(ch32h4)]
+    return r.ch(num).cntr().read().ndt() as usize;
+}
+
 fn tcif(r: pac::dma::Dma, num: usize) -> bool {
     #[cfg(not(ch32h4))]
     return r.isr().read().tcif(num);
@@ -982,11 +989,11 @@ impl RingPositionReader {
                 // going, so read NDTR between two looks at TCIF
                 let laps = state.complete_count.load(Ordering::Acquire) as u32;
                 let tc_before = tcif(r, info.num);
-                let mut ndt = r.ch(info.num).ndtr().read().ndt() as usize;
+                let mut ndt = remaining(r, info.num);
                 let tc = tcif(r, info.num);
                 if tc && !tc_before {
                     // wrapped while reading: NDTR may be from before the wrap
-                    ndt = r.ch(info.num).ndtr().read().ndt() as usize;
+                    ndt = remaining(r, info.num);
                 }
                 // NDTR reloads on the wrap; 0 can only be the instant before it
                 let index = if ndt == 0 { 0 } else { len - ndt };
