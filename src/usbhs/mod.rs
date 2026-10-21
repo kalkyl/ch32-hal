@@ -131,6 +131,8 @@ pub(crate) static IN_STATE: [EpState; MAX_NR_EP] = [EpState::NEW; MAX_NR_EP];
 /// The setup packet, copied out of the EP0 buffer by the interrupt.
 static SETUP: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
 static SETUP_READY: AtomicBool = AtomicBool::new(false);
+/// EP0's buffer: the DMA address registers read back only their low 16 bits.
+static EP0_BUF: AtomicU32 = AtomicU32::new(0);
 
 /// The peripheral's base address, for the free functions (0 until a driver exists).
 static REGS: AtomicUsize = AtomicUsize::new(0);
@@ -345,7 +347,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             // a new control transfer: whatever EP0 was doing is over
             d.ep_rx_ctrl(0).write(|w| w.set_mask_uep_r_res(EpRxResponse::NAK));
             d.ep_tx_ctrl(0).write(|w| w.set_mask_uep_t_res(EpTxResponse::NAK));
-            let buf = d.ep0_dma().read() as *const u32;
+            let buf = EP0_BUF.load(Ordering::Relaxed) as *const u32;
             SETUP[0].store(core::ptr::read_volatile(buf), Ordering::Relaxed);
             SETUP[1].store(core::ptr::read_volatile(buf.add(1)), Ordering::Relaxed);
             OUT_STATE[0].ready.store(false, Ordering::Relaxed);
@@ -558,6 +560,7 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> embassy_usb_driver:
 
         let ep0_buf = self.allocator.alloc_endpoint(control_max_packet_size).unwrap();
         d.ep0_dma().write_value(ep0_buf.addr() as u32);
+        EP0_BUF.store(ep0_buf.addr() as u32, Ordering::Relaxed);
         d.ep_max_len(0).write(|w| w.set_len(control_max_packet_size));
         d.ep_rx_ctrl(0).write(|w| w.set_mask_uep_r_res(EpRxResponse::NAK));
         d.ep_tx_ctrl(0).write(|w| w.set_mask_uep_t_res(EpTxResponse::NAK));
