@@ -1088,6 +1088,7 @@ impl<'a> CircularTransfer<'a> {
             circular: true,
             half_transfer_ir: interrupts,
             complete_transfer_ir: interrupts,
+            ..Default::default()
         };
         self.channel
             .configure(request, dir, peri_addr, mem_addr, len, true, size, options);
