@@ -52,6 +52,10 @@ pub enum SlaveError {
     Dma,
     /// NSS stayed low: no pause between bursts to start in.
     NoPause,
+    /// The RX position went backwards: the DMA interrupt was held off for more than a pass
+    /// and missed counting it, so the half index can't be trusted. Run the DMA interrupt
+    /// above code that can take that long.
+    LostLap,
 }
 
 /// A completed half.
@@ -214,6 +218,9 @@ impl<'d, T: Instance, W: Word> SpiSlaveRing<'d, T, W> {
             let new = done.wrapping_sub(self.delivered);
             if new == 0 {
                 return Poll::Pending;
+            }
+            if new > u32::MAX / 2 {
+                return Poll::Ready(Err(SlaveError::LostLap));
             }
             self.delivered = done;
             Poll::Ready(Ok(Half {

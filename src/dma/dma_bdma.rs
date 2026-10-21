@@ -995,7 +995,9 @@ fn tcif(r: pac::dma::Dma, num: usize) -> bool {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RingPosition {
-    /// completed passes since the transfer was configured (wraps)
+    /// completed passes since the transfer was configured (wraps). the DMA interrupt counts
+    /// them: one held off (masked, or behind a handler at its level) for more than a pass
+    /// misses one
     pub laps: u32,
     /// next element, `0..len`
     pub index: usize,
