@@ -758,6 +758,10 @@ pub struct Driver<'d, T: Instance, const NR_EP: usize, const SIZE: usize> {
     allocator: EndpointBufferAllocator<'d, NR_EP, SIZE>,
     allocated_in: Bitmap<MAX_NR_EP>,
     allocated_out: Bitmap<MAX_NR_EP>,
+    /// endpoint numbers with an isochronous endpoint in either direction
+    iso_nums: Bitmap<MAX_NR_EP>,
+    /// endpoint numbers with a bulk / interrupt endpoint in either direction
+    other_nums: Bitmap<MAX_NR_EP>,
 }
 
 impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP, SIZE> {
@@ -825,6 +829,8 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
             allocator,
             allocated_in: Bitmap::new(),
             allocated_out: Bitmap::new(),
+            iso_nums: Bitmap::new(),
+            other_nums: Bitmap::new(),
         }
     }
 
@@ -836,6 +842,10 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
         interval_ms: u8,
         dir: Direction,
     ) -> Result<Endpoint<'d, T, D, SIZE>, EndpointAllocError> {
+        let iso = ep_type == EndpointType::Isochronous;
+        // the other direction's type: a PING to a bulk OUT whose number is iso on the IN side
+        // hangs the SIE (no endpoint answers after it)
+        let taken = if iso { self.other_nums } else { self.iso_nums };
         let allocated = match dir {
             Direction::Out => &mut self.allocated_out,
             Direction::In => &mut self.allocated_in,
@@ -857,13 +867,19 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
             }
             None => {
                 // Find a free endpoint address; endpoint 0 is the control pipe's
-                let ep_num = allocated.next_false_index(1).ok_or(EndpointAllocError)?;
+                let ep_num = (1..MAX_NR_EP)
+                    .find(|&i| !allocated.get(i) && !taken.get(i))
+                    .ok_or(EndpointAllocError)?;
                 allocated.set(ep_num, true);
                 EndpointAddress::from_parts(ep_num, dir)
             }
         };
 
-        let iso = ep_type == EndpointType::Isochronous;
+        if iso {
+            self.iso_nums.set(addr.index(), true);
+        } else {
+            self.other_nums.set(addr.index(), true);
+        }
         let slots = match (iso, dir) {
             (false, _) => 1,
             (true, Direction::Out) => ISO_OUT_SLOTS,
