@@ -69,12 +69,12 @@ static ISO_OUT_EPS: AtomicU16 = AtomicU16::new(0);
 /// Isochronous IN endpoints polled every (micro)frame, a bit each
 static ISO_IN_EVERY: AtomicU16 = AtomicU16::new(0);
 
-/// The enabled endpoints of `mask` (bit n: endpoint n) whose IN direction is enabled.
+/// The endpoints of `mask` (bit n: endpoint n) whose IN direction is enabled.
 fn in_enabled(d: crate::pac::usbhs::Usbd, mask: u16) -> u16 {
     if mask == 0 {
         return 0;
     }
-    // EP_CONFIG bit n: endpoint n's IN enabled
+    // EP_CONFIG bit n: endpoint n's IN enable
     mask & d.ep_config().read().0 as u16
 }
 
@@ -169,11 +169,17 @@ static EP0_BUF: AtomicU32 = AtomicU32::new(0);
 /// The peripheral's base address, for the free functions (0 until a driver exists).
 static REGS: AtomicUsize = AtomicUsize::new(0);
 static SOF_CALLBACK: AtomicUsize = AtomicUsize::new(0);
+/// The frame number of the last SOF handled
+static SOF_FRAME: AtomicU16 = AtomicU16::new(NO_FRAME);
 /// Polls of MIS_ST to wait for an iso OUT to finish: longer than a 1024-byte packet
 const SIE_WAIT: u32 = 2000;
+
+/// The frame number register: frame (bits 10:0) and microframe (bits 15:13); bits 12:11
+/// are always 0, so this is never a frame number.
+const NO_FRAME: u16 = 0x1800;
 const MICROFRAME_MASK: u16 = (1 << 14) - 1;
 
-/// FRAME_NO (frame in bits 10:0, microframe in 15:13) as a microframe count
+/// A frame number as a microframe count
 fn microframe_index(frame: u16) -> u16 {
     (frame & 0x7FF) << 3 | frame >> 13
 }
@@ -181,9 +187,6 @@ fn microframe_index(frame: u16) -> u16 {
 fn frame_of_index(i: u16) -> u16 {
     (i >> 3) & 0x7FF | (i & 7) << 13
 }
-
-/// The frame number of the last SOF handled
-static SOF_FRAME: AtomicU16 = AtomicU16::new(NO_FRAME);
 
 fn dregs() -> Option<crate::pac::usbhs::Usbd> {
     match REGS.load(Ordering::Acquire) {
@@ -201,20 +204,10 @@ pub fn set_sof_callback(f: fn()) {
     }
 }
 
-/// The frame number register: frame (bits 10:0) and microframe (bits 15:13); bits 12:11
-/// are always 0, so this is never a frame number.
-const NO_FRAME: u16 = 0x1800;
-
-/// The current microframe number, from the frame number register: 8 per frame, wrapping
-/// at 2^14. Counts microframes whose SOF interrupt was lost (see the iso IN completion).
+/// The current microframe number: 8 per frame, wrapping at 2^14. Read from the frame
+/// number register, so it also counts microframes whose SOF interrupt was missed.
 pub fn microframe() -> u16 {
-    match dregs() {
-        Some(d) => {
-            let f = d.frame_no().read().frame_no();
-            (f & 0x7FF) << 3 | f >> 13
-        }
-        None => 0,
-    }
+    dregs().map_or(0, |d| microframe_index(d.frame_no().read().frame_no()))
 }
 
 /// Whether the host enabled endpoint `ep` in `direction` (for an isochronous one: selected
@@ -261,6 +254,9 @@ pub fn iso_in_register_waker(ep: usize, waker: &core::task::Waker) {
 /// Packets queued on isochronous IN endpoint `ep` and not yet taken by the host
 /// (including the one loaded in the endpoint).
 pub fn iso_in_pending(ep: usize) -> u8 {
+    if ep == 0 || ep >= MAX_NR_EP {
+        return 0;
+    }
     IN_STATE[ep].count()
 }
 
@@ -368,7 +364,6 @@ fn iso_out_check(r: crate::pac::usbhs::Usb, d: crate::pac::usbhs::Usbd, entry: O
         if unsafe { core::ptr::read_volatile(slot as *const u32) } == ISO_OUT_MARK {
             continue;
         }
-        let head = s.head.load(Ordering::Relaxed);
         let max = s.max_len.load(Ordering::Relaxed) as usize;
         let len = match entry {
             // RX_LEN as this packet's entry read it (releasing the flag clears it)
@@ -387,7 +382,7 @@ fn iso_out_check(r: crate::pac::usbhs::Usb, d: crate::pac::usbhs::Usbd, entry: O
             s.min_len.store(len, Ordering::Relaxed);
         }
         let n = s.slots.load(Ordering::Relaxed);
-        let mut head = head;
+        let mut head = s.head.load(Ordering::Relaxed);
         // what the slot to arm holds (marks past it are still there)
         let mut dirty = len as usize;
         if head.wrapping_sub(s.tail.load(Ordering::Acquire)) < n - 1 {
@@ -564,7 +559,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             // microframe's OUT may land on it first. its completion after the release sets
             // RX_LEN (and the flag again: that entry finds it taken)
             let mut out_late = false;
-            let mut out_len = true;
+            let mut rx_len_ok = true;
             if busy && st.token() == UsbToken::OUT && OUT_STATE[st.endp() as usize].iso.load(Ordering::Relaxed) {
                 let mut n = 0;
                 while !r.mis_st().read().sie_free() && n < SIE_WAIT {
@@ -575,7 +570,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                 // 0: it completed before the release, which cleared RX_LEN; another token:
                 // the next transaction already. the slot shows the length
                 if len == 0 || now.token() != UsbToken::OUT || now.endp() != st.endp() {
-                    out_len = false;
+                    rx_len_ok = false;
                 }
                 busy = false;
                 out_late = true;
@@ -584,7 +579,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                 // here
                 busy = false;
                 st = r.int_st().read();
-                out_len = false;
+                rx_len_ok = false;
                 nak_non_iso(d, st);
             }
             let ep = st.endp() as usize;
@@ -657,7 +652,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     UsbToken::SETUP => {}
                 }
             }
-            let entry = (!busy && out_len && token == UsbToken::OUT && iso && st.tog_ok()).then_some((ep, len));
+            let entry = (!busy && rx_len_ok && token == UsbToken::OUT && iso && st.tog_ok()).then_some((ep, len));
             // an OUT completes too early in its microframe to merge into the next SOF's entry,
             // and a busy entry takes its own OUT above
             if token != UsbToken::SOF {
@@ -803,8 +798,7 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
                 addr
             }
             None => {
-                // Find a free endpoint address; index 0 is the control endpoint
-                // endpoint 0 is the control pipe's (claimed in start())
+                // Find a free endpoint address; endpoint 0 is the control pipe's
                 let ep_num = allocated.next_false_index(1).ok_or(EndpointAllocError)?;
                 allocated.set(ep_num, true);
                 EndpointAddress::from_parts(ep_num, dir)
