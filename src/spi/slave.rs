@@ -256,6 +256,19 @@ impl<'d, T: Instance, W: Word> SpiSlaveRing<'d, T, W> {
         unsafe { core::slice::from_raw_parts_mut((self.tx_buf as *mut W).add(index * self.half_len), self.half_len) }
     }
 
+    /// [`rx_half`](Self::rx_half) and [`tx_half_mut`](Self::tx_half_mut) of the same half,
+    /// together.
+    pub fn half_mut(&mut self, index: usize) -> (&[W], &mut [W]) {
+        assert!(index < 2);
+        // SAFETY: as in `rx_half` and `tx_half_mut`; RX and TX are separate buffers
+        unsafe {
+            (
+                core::slice::from_raw_parts((self.rx_buf as *const W).add(index * self.half_len), self.half_len),
+                core::slice::from_raw_parts_mut((self.tx_buf as *mut W).add(index * self.half_len), self.half_len),
+            )
+        }
+    }
+
     /// Reads the RX position from anywhere (e.g. a USB SOF interrupt measuring the
     /// master's clock). Valid until the next [`start`](Self::start) / [`restart`](Self::restart),
     /// which reset it.
