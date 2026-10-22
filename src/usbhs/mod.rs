@@ -88,6 +88,8 @@ pub(crate) struct EpState {
     pub(crate) lens: [AtomicU16; ISO_OUT_SLOTS],
     /// OUT: packets dropped on a full ring
     pub(crate) overruns: AtomicU32,
+    /// IN: the frame number of the last iso completion (`NO_FRAME`: none)
+    pub(crate) last_frame: AtomicU16,
 }
 
 impl EpState {
@@ -106,9 +108,11 @@ impl EpState {
         loaded: AtomicBool::new(false),
         lens: [const { AtomicU16::new(0) }; ISO_OUT_SLOTS],
         overruns: AtomicU32::new(0),
+        last_frame: AtomicU16::new(NO_FRAME),
     };
 
     fn reset(&self) {
+        self.last_frame.store(NO_FRAME, Ordering::Relaxed);
         self.ready.store(false, Ordering::Relaxed);
         self.armed.store(false, Ordering::Relaxed);
         self.head.store(0, Ordering::Relaxed);
@@ -154,6 +158,22 @@ pub fn set_sof_callback(f: fn()) {
     SOF_CALLBACK.store(f as usize, Ordering::Release);
     if let Some(d) = dregs() {
         critical_section::with(|_| d.int_en().modify(|w| w.set_sof_act(true)));
+    }
+}
+
+/// The frame number register: frame (bits 10:0) and microframe (bits 15:13); bits 12:11
+/// are always 0, so this is never a frame number.
+const NO_FRAME: u16 = 0x1800;
+
+/// The current microframe number, from the frame number register: 8 per frame, wrapping
+/// at 2^14. Counts microframes whose SOF interrupt was lost (see the iso IN completion).
+pub fn microframe() -> u16 {
+    match dregs() {
+        Some(d) => {
+            let f = d.frame_no().read().frame_no();
+            (f & 0x7FF) << 3 | f >> 13
+        }
+        None => 0,
     }
 }
 
@@ -259,6 +279,14 @@ fn iso_in_enqueue_with(ep: usize, f: impl FnOnce(&mut [u8]) -> usize) -> bool {
     true
 }
 
+/// Record an iso IN completion in microframe `frame` (interrupt only); `false` if one is
+/// recorded in it already.
+fn first_in_frame(s: &EpState, frame: u16) -> bool {
+    let first = s.last_frame.load(Ordering::Relaxed) != frame;
+    s.last_frame.store(frame, Ordering::Relaxed);
+    first
+}
+
 /// Load slot `tail` into the endpoint, or a zero-length packet if the ring is empty.
 /// Interrupt only (see `iso_in_enqueue_with`).
 fn iso_in_load(d: crate::pac::usbhs::Usbd, ep: usize) {
@@ -346,6 +374,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             }
             // release early: INT_ST / RX_LEN are read
             r.int_fg().write(|w| w.set_transfer(true));
+            let frame = d.frame_no().read().frame_no();
 
             match token {
                 UsbToken::SOF => {
@@ -384,6 +413,13 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     s.ready.store(true, Ordering::Release);
                     s.waker.wake();
                 }
+                // INT_ST shows a token as soon as it arrives, not when its transaction
+                // completes: an entry for the SOF that runs late reads the microframe's iso
+                // IN token and looks like its completion, and the real one follows in the
+                // same microframe. one iso IN per microframe (no high bandwidth), so a second
+                // in the same one is that real completion, already counted: the packet loaded
+                // at the first goes out next. (counting both marked that packet sent unsent)
+                UsbToken::IN if iso && !first_in_frame(&IN_STATE[ep], frame) => {}
                 UsbToken::IN if iso => {
                     let s = &IN_STATE[ep];
                     if s.loaded.load(Ordering::Relaxed) {
