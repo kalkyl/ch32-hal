@@ -91,16 +91,14 @@ impl<'d, T: Instance, const SIZE: usize> EndpointOut for Endpoint<'d, T, Out, SI
                 if !self.is_enabled() {
                     return Poll::Ready(Err(EndpointError::Disabled));
                 }
-                if s.count() == 0 {
-                    return Poll::Pending;
+                match super::iso_out_take(index, |p| {
+                    let len = p.len().min(buf.len());
+                    buf[..len].copy_from_slice(&p[..len]);
+                    len
+                }) {
+                    Some(len) => Poll::Ready(Ok(len)),
+                    None => Poll::Pending,
                 }
-                let tail = s.tail.load(Ordering::Relaxed);
-                let n = s.slots.load(Ordering::Relaxed);
-                let len = (s.lens[(tail % n) as usize].load(Ordering::Relaxed) as usize).min(buf.len());
-                // SAFETY: a slot in [tail, head): the DMA is done with it until tail moves
-                unsafe { core::ptr::copy_nonoverlapping(s.slot_addr(tail) as *const u8, buf.as_mut_ptr(), len) };
-                s.tail.store(tail.wrapping_add(1), Ordering::Release);
-                Poll::Ready(Ok(len))
             })
             .await;
         }
@@ -154,7 +152,7 @@ impl<'d, T: Instance, const SIZE: usize> EndpointIn for Endpoint<'d, T, In, SIZE
                 if !self.is_enabled() {
                     return Poll::Ready(Err(EndpointError::Disabled));
                 }
-                if iso_in_enqueue(T::dregs(), index, buf) {
+                if iso_in_enqueue(index, buf) {
                     Poll::Ready(Ok(()))
                 } else {
                     Poll::Pending

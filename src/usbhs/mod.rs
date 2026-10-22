@@ -9,13 +9,14 @@
 //!
 //! Isochronous endpoints run without a task in the loop:
 //! - OUT: a ring of [`ISO_OUT_SLOTS`] packet buffers. The interrupt points the endpoint's
-//!   DMA at the next free slot after each packet; `read` drains the ring. A full ring
-//!   drops the newest packet.
+//!   DMA at the next free slot after each packet; `read` drains the ring, or
+//!   [`iso_out_take`] in place. A full ring drops the newest packet.
 //! - IN: a ring of [`ISO_IN_SLOTS`] packets. After each IN transaction the interrupt
 //!   loads the next queued packet, or a zero-length one when none is queued. `write`
 //!   waits for a free slot, so a writer keeps the ring full and stays at most
 //!   [`ISO_IN_SLOTS`] packets ahead; [`iso_in_prime`] queues from an interrupt (e.g. an
-//!   explicit feedback value from the SOF callback).
+//!   explicit feedback value from the SOF callback), [`iso_in_fill`] in place.
+//! - Both work from the SOF callback, without a task: one packet each way per microframe.
 //! - Each slot is one endpoint buffer from the driver's buffer array, so the array needs
 //!   room for the rings: one buffer for EP0 and each bulk / interrupt endpoint, plus
 //!   [`ISO_OUT_SLOTS`] per isochronous OUT and [`ISO_IN_SLOTS`] per isochronous IN.
@@ -58,6 +59,8 @@ const EP_MAX_PACKET_SIZE: u16 = 64;
 pub const ISO_OUT_SLOTS: usize = 16;
 /// Packets queued per isochronous IN endpoint.
 pub const ISO_IN_SLOTS: usize = 2;
+// the ring indices are u8s that wrap: a slot count that doesn't divide 256 would skip slots
+const _: () = assert!(256 % ISO_OUT_SLOTS == 0 && 256 % ISO_IN_SLOTS == 0);
 
 /// The isochronous IN response: "data ready" (TinyUSB `USBHS_EP_T_RES_NYET`).
 const TX_RES_ISO: EpTxResponse = EpTxResponse::_RESERVED_1;
@@ -154,6 +157,47 @@ pub fn set_sof_callback(f: fn()) {
     }
 }
 
+/// Whether the host enabled endpoint `ep` in `direction` (for an isochronous one: selected
+/// its interface's streaming alternate setting).
+pub fn endpoint_enabled(ep: usize, direction: Direction) -> bool {
+    let Some(d) = dregs() else { return false };
+    if ep == 0 || ep >= MAX_NR_EP {
+        return false;
+    }
+    match direction {
+        Direction::Out => d.ep_config().read().r_en(ep - 1),
+        Direction::In => d.ep_config().read().t_en(ep - 1),
+    }
+}
+
+/// Take the oldest packet waiting on isochronous OUT endpoint `ep`, in place: `f` reads
+/// it, then its slot goes back to the ring. `None`: no packet waiting (or not an
+/// isochronous OUT endpoint). One reader per endpoint; callable from interrupts.
+pub fn iso_out_take<R>(ep: usize, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    if ep == 0 || ep >= MAX_NR_EP {
+        return None;
+    }
+    let s = &OUT_STATE[ep];
+    if !s.iso.load(Ordering::Relaxed) || s.count() == 0 {
+        return None;
+    }
+    let tail = s.tail.load(Ordering::Relaxed);
+    let n = s.slots.load(Ordering::Relaxed);
+    let len = s.lens[(tail % n) as usize].load(Ordering::Relaxed) as usize;
+    // SAFETY: a slot in [tail, head): the DMA is done with it until tail moves
+    let r = f(unsafe { core::slice::from_raw_parts(s.slot_addr(tail) as *const u8, len) });
+    s.tail.store(tail.wrapping_add(1), Ordering::Release);
+    Some(r)
+}
+
+/// Wake `waker` when isochronous IN endpoint `ep` sends a packet (a slot frees up), to
+/// refill it from a task. One waiter per endpoint, shared with the endpoint's `write`.
+pub fn iso_in_register_waker(ep: usize, waker: &core::task::Waker) {
+    if ep != 0 && ep < MAX_NR_EP {
+        IN_STATE[ep].waker.register(waker);
+    }
+}
+
 /// Packets queued on isochronous IN endpoint `ep` and not yet taken by the host
 /// (including the one loaded in the endpoint).
 pub fn iso_in_pending(ep: usize) -> u8 {
@@ -167,37 +211,56 @@ pub fn iso_in_prime(ep: usize, data: &[u8]) -> bool {
     if ep == 0 || ep >= MAX_NR_EP || !d.ep_config().read().t_en(ep - 1) {
         return false;
     }
-    iso_in_enqueue(d, ep, data)
+    iso_in_enqueue(ep, data)
 }
 
-/// Copy `data` into the next free slot and publish it; loads it at once if the endpoint
-/// has nothing loaded. The slot at `head` is never touched by the interrupt, so the copy
-/// runs outside the critical section. One producer per endpoint.
-pub(crate) fn iso_in_enqueue(d: crate::pac::usbhs::Usbd, ep: usize, data: &[u8]) -> bool {
+/// Build one packet on isochronous IN endpoint `ep` in place and queue it: `f` fills the
+/// next free slot (one endpoint buffer; keep to the endpoint's max packet size) and
+/// returns the packet's length. `false`: not queued and `f` not run (ring full, endpoint
+/// not enabled or not isochronous). Callable from interrupts.
+pub fn iso_in_fill(ep: usize, f: impl FnOnce(&mut [u8]) -> usize) -> bool {
+    let Some(d) = dregs() else { return false };
+    if ep == 0 || ep >= MAX_NR_EP || !d.ep_config().read().t_en(ep - 1) {
+        return false;
+    }
+    iso_in_enqueue_with(ep, f)
+}
+
+/// Copy `data` into the next free slot and publish it (see [`iso_in_enqueue_with`]).
+pub(crate) fn iso_in_enqueue(ep: usize, data: &[u8]) -> bool {
+    if data.len() > IN_STATE[ep].stride.load(Ordering::Relaxed) as usize {
+        return false;
+    }
+    iso_in_enqueue_with(ep, |slot| {
+        slot[..data.len()].copy_from_slice(data);
+        data.len()
+    })
+}
+
+/// `f` fills the next free slot, then it's published. The slot at `head` is never touched
+/// by the interrupt, so `f` runs without a critical section. One producer per endpoint.
+///
+/// The producer never loads the endpoint itself: the interrupt loads the next packet after
+/// every IN, the zero-length one included. Loading while the endpoint answers an IN with
+/// the zero-length packet (the ring ran empty) can't be told apart from the packet going
+/// out, and that packet would be lost; this way it goes out one microframe later.
+fn iso_in_enqueue_with(ep: usize, f: impl FnOnce(&mut [u8]) -> usize) -> bool {
     let s = &IN_STATE[ep];
     let n = s.slots.load(Ordering::Relaxed);
-    if !s.iso.load(Ordering::Relaxed) || data.len() > s.stride.load(Ordering::Relaxed) as usize || s.count() >= n {
+    if !s.iso.load(Ordering::Relaxed) || s.count() >= n {
         return false;
     }
     let head = s.head.load(Ordering::Relaxed);
+    let stride = s.stride.load(Ordering::Relaxed) as usize;
     // SAFETY: the slot is inside the ring's buffers and not in [tail, head)
-    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), s.slot_addr(head) as *mut u8, data.len()) };
-    s.lens[(head % n) as usize].store(data.len() as u16, Ordering::Relaxed);
-    critical_section::with(|_| {
-        s.head.store(head.wrapping_add(1), Ordering::Release);
-        if !s.loaded.load(Ordering::Relaxed) {
-            iso_in_load(d, ep);
-        }
-    });
+    let len = f(unsafe { core::slice::from_raw_parts_mut(s.slot_addr(head) as *mut u8, stride) }).min(stride);
+    s.lens[(head % n) as usize].store(len as u16, Ordering::Relaxed);
+    s.head.store(head.wrapping_add(1), Ordering::Release);
     true
 }
 
 /// Load slot `tail` into the endpoint, or a zero-length packet if the ring is empty.
-/// Interrupt or critical section only.
-///
-/// Loading while the endpoint is already answering an IN with the zero-length packet
-/// (the ring ran empty) can't be told apart from the packet going out: that one packet is
-/// lost. A writer that keeps the ring full doesn't run into it.
+/// Interrupt only (see `iso_in_enqueue_with`).
 fn iso_in_load(d: crate::pac::usbhs::Usbd, ep: usize) {
     let s = &IN_STATE[ep];
     if s.count() > 0 {
