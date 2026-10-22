@@ -90,7 +90,8 @@ pub(crate) struct EpState {
     /// the loaded packet went out
     pub(crate) ready: AtomicBool,
     pub(crate) len: AtomicU16,
-    /// OUT: a read is waiting (the endpoint answers ACK)
+    /// bulk / interrupt: OUT -- a read is waiting (the endpoint answers ACK); IN -- a packet
+    /// is loaded
     pub(crate) armed: AtomicBool,
     pub(crate) iso: AtomicBool,
     // isochronous ring: slot i at base + (i % slots) * stride; [tail, head) hold packets
@@ -112,6 +113,8 @@ pub(crate) struct EpState {
     pub(crate) min_len: AtomicU16,
     /// isochronous OUT: the armed slot's address
     pub(crate) armed_slot: AtomicU32,
+    /// bulk / interrupt: R_TOG / T_TOG after the last packet taken / sent (DATA1: true)
+    pub(crate) tog: AtomicBool,
 }
 
 impl EpState {
@@ -134,6 +137,7 @@ impl EpState {
         max_len: AtomicU16::new(0),
         min_len: AtomicU16::new(0),
         armed_slot: AtomicU32::new(0),
+        tog: AtomicBool::new(false),
     };
 
     fn reset(&self) {
@@ -143,6 +147,7 @@ impl EpState {
         self.head.store(0, Ordering::Relaxed);
         self.tail.store(0, Ordering::Relaxed);
         self.loaded.store(false, Ordering::Relaxed);
+        self.tog.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn count(&self) -> u8 {
@@ -339,7 +344,9 @@ fn iso_in_complete(d: crate::pac::usbhs::Usbd, ep: usize) {
 fn nak_non_iso(d: crate::pac::usbhs::Usbd, st: ch32_metapac::usbhs::regs::IntSt) {
     let ep = st.endp() as usize;
     match st.token() {
-        UsbToken::OUT if st.tog_ok() && !OUT_STATE[ep].iso.load(Ordering::Relaxed) => {
+        // bulk / interrupt: before knowing whether a packet went through (`toggled`), so the
+        // next can't land on it
+        UsbToken::OUT if (ep == 0 && st.tog_ok()) || (ep != 0 && !OUT_STATE[ep].iso.load(Ordering::Relaxed)) => {
             d.ep_rx_ctrl(ep).modify(|w| w.set_mask_uep_r_res(EpRxResponse::NAK))
         }
         UsbToken::IN if !IN_STATE[ep].iso.load(Ordering::Relaxed) => {
@@ -347,6 +354,34 @@ fn nak_non_iso(d: crate::pac::usbhs::Usbd, st: ch32_metapac::usbhs::regs::IntSt)
         }
         _ => {}
     }
+}
+
+/// A packet went through a bulk / interrupt endpoint (not EP0): the SIE flips its toggle on
+/// each one it accepts (OUT) or the host ACKs (IN). INT_ST's TOG_OK can't tell: the flag comes
+/// a little before the SIE goes free, and an entry that early reads it before it's final.
+/// Waits for the SIE. The entry NAKed the endpoint; a read / write still waiting gets it back.
+fn toggled(r: crate::pac::usbhs::Usb, d: crate::pac::usbhs::Usbd, ep: usize, dir: Direction) -> bool {
+    let mut n = 0;
+    while !r.mis_st().read().sie_free() && n < SIE_WAIT {
+        n += 1;
+    }
+    let (s, tog) = match dir {
+        Direction::Out => (&OUT_STATE[ep], d.ep_rx_ctrl(ep).read().mask_uep_r_tog()),
+        Direction::In => (&IN_STATE[ep], d.ep_tx_ctrl(ep).read().mask_uep_t_tog()),
+    };
+    let tog = tog == EpTog::DATA1;
+    if s.tog.load(Ordering::Relaxed) == tog {
+        if s.armed.load(Ordering::Relaxed) {
+            match dir {
+                Direction::Out => d.ep_rx_ctrl(ep).modify(|w| w.set_mask_uep_r_res(EpRxResponse::ACK)),
+                Direction::In => d.ep_tx_ctrl(ep).modify(|w| w.set_mask_uep_t_res(EpTxResponse::ACK)),
+            }
+        }
+        return false;
+    }
+    s.tog.store(tog, Ordering::Relaxed);
+    s.armed.store(false, Ordering::Relaxed);
+    true
 }
 
 /// Isochronous OUT arrivals, by the slot's first word: the endpoint's slot gets `ISO_OUT_MARK`
@@ -549,7 +584,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             let mut busy = !r.mis_st().read().sie_free();
             let mut st = r.int_st().read();
             let mut len = r.rx_len().read();
-            if !busy {
+            if !busy || (st.token() != UsbToken::SOF && st.endp() != 0) {
                 nak_non_iso(d, st);
             }
             // release early: INT_ST / RX_LEN are read
@@ -574,6 +609,26 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                 }
                 busy = false;
                 out_late = true;
+            } else if busy
+                && st.endp() != 0
+                && match st.token() {
+                    UsbToken::OUT => true, // iso: above
+                    UsbToken::IN => !IN_STATE[st.endp() as usize].iso.load(Ordering::Relaxed),
+                    _ => false,
+                }
+            {
+                // bulk / interrupt raise their flag before the SIE goes free too: this may be the
+                // shown transaction's own entry (`toggled` tells). an OUT completing after the
+                // release sets RX_LEN again
+                let mut n = 0;
+                while !r.mis_st().read().sie_free() && n < SIE_WAIT {
+                    n += 1;
+                }
+                busy = false;
+                let now = r.rx_len().read();
+                if now != 0 {
+                    len = now;
+                }
             } else if busy && r.mis_st().read().sie_free() && !r.int_fg().read().transfer() {
                 // it completed before the release, which took its flag (and RX_LEN): handle it
                 // here
@@ -623,8 +678,10 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     }
                     // iso OUT: see iso_out_check
                     UsbToken::OUT if iso => {}
-                    // a wrong toggle: a retransmit (lost ACK), dropped; the endpoint stays armed
-                    UsbToken::OUT if !st.tog_ok() => {}
+                    // no new packet (a retransmit after a lost ACK, or one NAKed): the endpoint
+                    // stays as it is
+                    UsbToken::OUT if ep != 0 && !toggled(r, d, ep, Direction::Out) => {}
+                    UsbToken::OUT if ep == 0 && !st.tog_ok() => {}
                     UsbToken::OUT => {
                         let s = &OUT_STATE[ep];
                         if ep == 0 {
@@ -640,6 +697,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     // one is a stale INT_ST, already counted
                     UsbToken::IN if iso && !first_in_frame(&IN_STATE[ep], frame) => {}
                     UsbToken::IN if iso => iso_in_complete(d, ep),
+                    UsbToken::IN if ep != 0 && !toggled(r, d, ep, Direction::In) => {}
                     UsbToken::IN => {
                         let s = &IN_STATE[ep];
                         if ep == 0 {
@@ -1084,26 +1142,33 @@ impl<'d, T: Instance> embassy_usb_driver::Bus for Bus<'d, T> {
                 d.ep_tx_ctrl(index)
                     .modify(|v| v.set_mask_uep_t_res(EpTxResponse::STALL));
             }
-            (Direction::Out, false) => d.ep_rx_ctrl(index).write(|v| {
-                // a read still waiting stays armed (or it would NAK forever)
-                v.set_mask_uep_r_res(if iso {
-                    EpRxResponse::NYET
-                } else if s.armed.load(Ordering::Relaxed) {
-                    EpRxResponse::ACK
-                } else {
-                    EpRxResponse::NAK
-                });
-                v.set_mask_uep_r_tog(EpTog::DATA0);
-                v.set_r_tog_auto(index != 0 && !iso);
-            }),
-            (Direction::In, false) => d.ep_tx_ctrl(index).write(|v| {
-                v.set_mask_uep_t_res(if iso { TX_RES_ISO } else { EpTxResponse::NAK });
-                v.set_mask_uep_t_tog(EpTog::DATA0);
-                v.set_t_tog_auto(index != 0 && !iso);
-            }),
+            (Direction::Out, false) => {
+                s.tog.store(false, Ordering::Relaxed);
+                d.ep_rx_ctrl(index).write(|v| {
+                    // a read still waiting stays armed (or it would NAK forever)
+                    v.set_mask_uep_r_res(if iso {
+                        EpRxResponse::NYET
+                    } else if s.armed.load(Ordering::Relaxed) {
+                        EpRxResponse::ACK
+                    } else {
+                        EpRxResponse::NAK
+                    });
+                    v.set_mask_uep_r_tog(EpTog::DATA0);
+                    v.set_r_tog_auto(index != 0 && !iso);
+                })
+            }
+            (Direction::In, false) => {
+                s.tog.store(false, Ordering::Relaxed);
+                d.ep_tx_ctrl(index).write(|v| {
+                    v.set_mask_uep_t_res(if iso { TX_RES_ISO } else { EpTxResponse::NAK });
+                    v.set_mask_uep_t_tog(EpTog::DATA0);
+                    v.set_t_tog_auto(index != 0 && !iso);
+                })
+            }
         });
         if !stalled && ep_addr.direction() == Direction::In && !iso {
             // a write waiting on the stalled endpoint finishes (its data is dropped)
+            s.armed.store(false, Ordering::Relaxed);
             s.ready.store(true, Ordering::Release);
         }
         s.waker.wake();
