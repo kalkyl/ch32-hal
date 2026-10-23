@@ -703,6 +703,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                         if ep == 0 {
                             d.ep_tx_ctrl(0)
                                 .modify(|w| w.set_mask_uep_t_tog(flip(w.mask_uep_t_tog())));
+                            s.armed.store(false, Ordering::Relaxed);
                         }
                         s.ready.store(true, Ordering::Release);
                         s.waker.wake();
@@ -716,6 +717,9 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             if token != UsbToken::SOF {
                 iso_out_check(r, d, entry);
             }
+            if ep == 0 {
+                ep0_moved_on(d, token);
+            }
         }
 
         if flag.setup_act() {
@@ -725,13 +729,47 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             let buf = EP0_BUF.load(Ordering::Relaxed) as *const u32;
             SETUP[0].store(core::ptr::read_volatile(buf), Ordering::Relaxed);
             SETUP[1].store(core::ptr::read_volatile(buf.add(1)), Ordering::Relaxed);
-            OUT_STATE[0].ready.store(false, Ordering::Relaxed);
-            IN_STATE[0].ready.store(false, Ordering::Relaxed);
+            for s in [&OUT_STATE[0], &IN_STATE[0]] {
+                s.ready.store(false, Ordering::Relaxed);
+                s.armed.store(false, Ordering::Relaxed);
+            }
             SETUP_READY.store(true, Ordering::Release);
             r.int_fg().write(|w| w.set_setup_act(true));
             OUT_STATE[0].waker.wake();
             IN_STATE[0].waker.wake();
         }
+    }
+}
+
+/// An EP0 stage whose completion no entry saw: the flag is one bit and INT_ST shows the
+/// latest token, NAKed ones too, so a host polling a bulk IN right after an EP0 transaction
+/// hides it (EP0 has no auto toggle to tell). The host's token for the other direction says
+/// it went through: the status stage after the last data packet. (one hidden before the
+/// last gets resent with the same toggle, which the host drops, and completes then.)
+fn ep0_moved_on(d: crate::pac::usbhs::Usbd, token: UsbToken) {
+    match token {
+        UsbToken::OUT if IN_STATE[0].armed.load(Ordering::Relaxed) => {
+            d.ep_tx_ctrl(0).modify(|w| {
+                w.set_mask_uep_t_res(EpTxResponse::NAK);
+                w.set_mask_uep_t_tog(flip(w.mask_uep_t_tog()));
+            });
+            let s = &IN_STATE[0];
+            s.armed.store(false, Ordering::Relaxed);
+            s.ready.store(true, Ordering::Release);
+            s.waker.wake();
+        }
+        UsbToken::IN if OUT_STATE[0].armed.load(Ordering::Relaxed) => {
+            d.ep_rx_ctrl(0).modify(|w| {
+                w.set_mask_uep_r_res(EpRxResponse::NAK);
+                w.set_mask_uep_r_tog(flip(w.mask_uep_r_tog()));
+            });
+            // `len`: the packet the stage expects (`ControlPipe` sets it)
+            let s = &OUT_STATE[0];
+            s.armed.store(false, Ordering::Relaxed);
+            s.ready.store(true, Ordering::Release);
+            s.waker.wake();
+        }
+        _ => {}
     }
 }
 
