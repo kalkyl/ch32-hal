@@ -78,6 +78,9 @@ embassy = [
 defmt = ["dep:defmt", "embassy-usb-driver/defmt"]
 memory-x = ["ch32-metapac/memory-x"]
 memory-split-usr = ["memory-x", "ch32-metapac/memory-split-usr"]
+## USBHS host mode (`usbhs::host`). Needs embassy-usb-driver's host traits from embassy
+## main (patch it in), not 0.2.2's.
+usbhs-host = ["embassy"]
 ## Built-in EXTI driver and interrupt handlers. Disable to provide your own.
 exti = []
 

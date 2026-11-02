@@ -55,6 +55,8 @@ use crate::{interrupt, Peri, PeripheralType};
 
 pub mod control;
 mod endpoint;
+#[cfg(feature = "usbhs-host")]
+pub mod host;
 
 const MAX_NR_EP: usize = 16;
 const EP_MAX_PACKET_SIZE: u16 = 64;
