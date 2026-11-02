@@ -12,7 +12,8 @@
 //! One isochronous IN pipe runs without a task in the loop: once its first `request_in`
 //! arms it, the interrupt starts its IN on every SOF of its period (ahead of any waiting
 //! transaction: those start only while no IN is due) and the DMA writes the packet straight
-//! into a ring in [`Buffers`]. `request_in` drains the ring. [`iso_in_stats`] counts the
+//! into a ring in [`Buffers`]. `request_in` drains the ring (`Pipe::read_iso` too, with the
+//! frame number register as each packet arrived). [`iso_in_stats`] counts the
 //! packets, the periods whose IN never went out (missed), the packets dropped on a full
 //! ring and the INs without a valid answer.
 //!
