@@ -762,8 +762,9 @@ async fn transaction<T: Instance>(
     }
 }
 
-/// The next packet from the isochronous IN ring, arming the pipe on the first call.
-async fn iso_read<T: Instance>(generation: u8, buf: &mut [u8]) -> Result<usize, PipeError> {
+/// The next packet from the isochronous IN ring, arming the pipe on the first call: its
+/// length and the frame number register's value when it arrived.
+async fn iso_read<T: Instance>(generation: u8, buf: &mut [u8]) -> Result<(usize, u16), PipeError> {
     let gone = || GENERATION.load(Ordering::Relaxed) != generation || !attached::<T>();
     if gone() {
         return Err(PipeError::Disconnected);
@@ -784,13 +785,14 @@ async fn iso_read<T: Instance>(generation: u8, buf: &mut [u8]) -> Result<usize, 
             let slot = iso_slot(tail);
             // SAFETY: a slot in [tail, head): the interrupt is done with it until tail moves
             let len = unsafe { (slot as *const u16).read_volatile() } as usize;
+            let frame = unsafe { (slot as *const u16).add(1).read_volatile() };
             let r = if len > buf.len() {
                 Err(PipeError::BufferOverflow)
             } else {
                 unsafe {
                     core::ptr::copy_nonoverlapping((slot as usize + ISO_HEADER) as *const u8, buf.as_mut_ptr(), len);
                 }
-                Ok(len)
+                Ok((len, frame))
             };
             ISO_TAIL.store(tail.wrapping_add(1), Ordering::Release);
             return Poll::Ready(r);
@@ -850,6 +852,14 @@ impl<'d, T: Instance, E, D> Drop for Pipe<'d, T, E, D> {
             iso_stop();
             ISO_ALLOCATED.store(false, Ordering::Relaxed);
         }
+    }
+}
+
+impl<'d, T: Instance> Pipe<'d, T, pipe::Isochronous, pipe::In> {
+    /// `request_in`, plus the frame number register's value when the packet arrived (the
+    /// device's packets against USB time).
+    pub async fn read_iso(&mut self, buf: &mut [u8]) -> Result<(usize, u16), PipeError> {
+        iso_read::<T>(self.target.generation, buf).await
     }
 }
 
@@ -959,7 +969,7 @@ impl<'d, T: Instance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D> for Pipe<
         D: pipe::IsIn,
     {
         if self.iso {
-            return iso_read::<T>(self.target.generation, buf).await;
+            return iso_read::<T>(self.target.generation, buf).await.map(|(len, _)| len);
         }
         let nak = self.nak_retry();
         let mps = self.target.max_packet_size as usize;
