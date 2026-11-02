@@ -16,6 +16,9 @@
 //! packets, the periods whose IN never went out (missed), the packets dropped on a full
 //! ring and the INs without a valid answer.
 //!
+//! [`set_sof_hook`]: a function the interrupt calls first on every SOF, for timestamps
+//! against the bus's time.
+//!
 //! Register sequence after WCH's EVT host code (`ch32v30x_usbhs_host.c`): the bus reset
 //! runs at high speed so the device can chirp, then the speed the port settled on is
 //! written back to `USB_CTRL` and SOFs go out, as soon as the reset ends: the SIE sends no
@@ -29,7 +32,7 @@
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU16, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use ch32_metapac::usbhs::regs::{IntSt, UhEpPid, UhEpType};
@@ -194,6 +197,17 @@ pub fn iso_in_stats() -> IsoStats {
     }
 }
 
+/// the SOF hook, a `fn(u16)` (0: none)
+static SOF_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Have the interrupt call `hook` on every SOF, before anything else it does, with the frame
+/// number register (frame in bits 10:0, microframe in 15:13): for timestamps against the
+/// bus's time, taken a fixed time after the SOF went out. It runs in the USBHS interrupt:
+/// keep it short.
+pub fn set_sof_hook(hook: Option<fn(u16)>) {
+    SOF_HOOK.store(hook.map_or(0, |f| f as usize), Ordering::Release);
+}
+
 fn count(c: &AtomicU32) {
     c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 }
@@ -208,6 +222,14 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         let h = T::hregs();
         let flag = r.int_fg().read();
 
+        if flag.hst_sof() {
+            let hook = SOF_HOOK.load(Ordering::Acquire);
+            if hook != 0 {
+                // SAFETY: only ever stored from a `fn(u16)`
+                let hook: fn(u16) = core::mem::transmute(hook);
+                hook(r.frame_no().read().frame_no());
+            }
+        }
         if flag.detect() {
             r.int_fg().write(|w| w.set_detect(true));
             DETECTED.store(true, Ordering::Release);
