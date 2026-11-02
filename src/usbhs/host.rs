@@ -9,6 +9,13 @@
 //! The packet data goes through two DMA buffers ([`Buffers`]) that the transaction copies
 //! to and from while it holds the lock. Data toggles are kept per pipe in software.
 //!
+//! One isochronous IN pipe runs without a task in the loop: once its first `request_in`
+//! arms it, the interrupt starts its IN on every SOF of its period (ahead of any waiting
+//! transaction: those start only while no IN is due) and the DMA writes the packet straight
+//! into a ring in [`Buffers`]. `request_in` drains the ring. [`iso_in_stats`] counts the
+//! packets, the periods whose IN never went out (missed), the packets dropped on a full
+//! ring and the INs without a valid answer.
+//!
 //! Register sequence after WCH's EVT host code (`ch32v30x_usbhs_host.c`): the bus reset
 //! runs at high speed so the device can chirp, then the speed the port settled on is
 //! written back to `USB_CTRL` and SOFs go out, as soon as the reset ends: the SIE sends no
@@ -17,14 +24,15 @@
 //! Needs the host traits of embassy-usb-driver from embassy main (the `usbhs-host`
 //! feature).
 //!
-//! Not supported: isochronous pipes, split transactions (hubs), suspend / resume.
+//! Not supported: isochronous OUT, high-bandwidth isochronous (more than one transaction per
+//! microframe), split transactions (hubs), suspend / resume.
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU16, AtomicU32, AtomicU8, Ordering};
 use core::task::Poll;
 
-use ch32_metapac::usbhs::regs::{IntSt, UhEpPid};
+use ch32_metapac::usbhs::regs::{IntSt, UhEpPid, UhEpType};
 use ch32_metapac::usbhs::vals::{SpeedType, Tog};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -41,8 +49,10 @@ use crate::gpio::{AFType, Speed as PinSpeed};
 use crate::interrupt::typelevel::Interrupt;
 use crate::{interrupt, Peri};
 
-/// The largest packet a pipe can move (a high-speed bulk packet).
+/// The largest packet a bulk / interrupt / control pipe can move (a high-speed bulk packet).
 pub const MAX_PACKET: usize = 512;
+/// The largest isochronous packet (one transaction per microframe)
+pub const MAX_ISO_PACKET: usize = 1024;
 
 /// USB 2.0 §7.1.7.5: at least 50 ms for a root port.
 const ROOT_RESET_MS: u64 = 50;
@@ -61,6 +71,10 @@ const NO_RESPONSE_RETRIES: u8 = 3;
 const TOGGLE_RETRIES: u8 = 3;
 /// Polls of MIS_ST for the SIE to go free after a token is stopped
 const SIE_WAIT: u32 = 2000;
+/// Slots in the isochronous ring at most (a power of two: the indices are wrapping u8s)
+const ISO_MAX_SLOTS: usize = 64;
+/// Ahead of each slot's data: its length (u16) and the frame number it arrived in (u16)
+const ISO_HEADER: usize = 4;
 
 // token and handshake PIDs (USB 2.0 table 8-1)
 const PID_OUT: u8 = 0x1;
@@ -72,15 +86,27 @@ const PID_NAK: u8 = 0xA;
 const PID_STALL: u8 = 0xE;
 const PID_DATA0: u8 = 0x3;
 const PID_DATA1: u8 = 0xB;
+const PID_DATA2: u8 = 0x7;
+const PID_MDATA: u8 = 0xF;
+
+/// What the SIE is doing (`ENGINE`)
+const IDLE: u8 = 0;
+/// a task's transaction
+const ASYNC: u8 = 1;
+/// the isochronous IN
+const ISO: u8 = 2;
 
 static BUS_WAKER: AtomicWaker = AtomicWaker::new();
 /// A connect / disconnect was flagged since the last time the bus task looked
 static DETECTED: AtomicBool = AtomicBool::new(false);
 
+/// Who has the SIE. Changed in the interrupt and in critical sections.
+static ENGINE: AtomicU8 = AtomicU8::new(IDLE);
+/// A task waiting for the SIE to go idle
+static ENGINE_WAKER: AtomicWaker = AtomicWaker::new();
+
 static XFER_WAKER: AtomicWaker = AtomicWaker::new();
-/// A token is on the bus and its interrupt hasn't been handled
-static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-/// The interrupt recorded the transaction's result
+/// The interrupt recorded the task's transaction's result
 static DONE: AtomicBool = AtomicBool::new(false);
 static RESULT_ST: AtomicU8 = AtomicU8::new(0);
 static RESULT_LEN: AtomicU16 = AtomicU16::new(0);
@@ -89,27 +115,87 @@ static OVERFLOW: AtomicBool = AtomicBool::new(false);
 /// Bumped by every bus reset and detach: pipes allocated before it fail with
 /// `Disconnected`. Written from tasks only.
 static GENERATION: AtomicU8 = AtomicU8::new(0);
-/// One transaction at a time
+/// One task transaction at a time
 static LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 
 /// the DMA buffers (the DMA address registers read back only their low 16 bits)
 static RX_BUF: AtomicU32 = AtomicU32::new(0);
 static TX_BUF: AtomicU32 = AtomicU32::new(0);
 
-/// The host's packet buffers, one per direction.
+// the isochronous IN pipe. slot i at ISO_RING + (i % slots) * stride; [tail, head) hold
+// packets, and the slot at head is always free: the DMA's target
+static ISO_RING: AtomicU32 = AtomicU32::new(0);
+static ISO_RING_LEN: AtomicU32 = AtomicU32::new(0);
+static ISO_ALLOCATED: AtomicBool = AtomicBool::new(false);
+/// An IN every period
+static ISO_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// This period's IN hasn't gone out
+static ISO_DUE: AtomicBool = AtomicBool::new(false);
+/// The IN on the bus lands in the head slot but the ring is full: it's dropped
+static ISO_DROP: AtomicBool = AtomicBool::new(false);
+static ISO_ADDR: AtomicU8 = AtomicU8::new(0);
+static ISO_EP: AtomicU8 = AtomicU8::new(0);
+static ISO_MPS: AtomicU16 = AtomicU16::new(0);
+/// SOFs per IN, and the SOFs left until the next
+static ISO_PERIOD: AtomicU8 = AtomicU8::new(1);
+static ISO_COUNTDOWN: AtomicU8 = AtomicU8::new(1);
+static ISO_STRIDE: AtomicU16 = AtomicU16::new(0);
+static ISO_SLOTS: AtomicU8 = AtomicU8::new(0);
+static ISO_HEAD: AtomicU8 = AtomicU8::new(0);
+static ISO_TAIL: AtomicU8 = AtomicU8::new(0);
+static ISO_WAKER: AtomicWaker = AtomicWaker::new();
+// counted in the interrupt only
+static ISO_PACKETS: AtomicU32 = AtomicU32::new(0);
+static ISO_MISSED: AtomicU32 = AtomicU32::new(0);
+static ISO_OVERRUNS: AtomicU32 = AtomicU32::new(0);
+static ISO_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// The host's packet buffers: one per direction for control, bulk and interrupt pipes,
+/// and `ISO` bytes for the isochronous IN ring. A slot takes the endpoint's max packet size
+/// (rounded up to 4) plus 4; the ring needs at least 2 slots, one of them always free.
 #[repr(C, align(4))]
-pub struct Buffers {
+pub struct Buffers<const ISO: usize = 0> {
     rx: [u8; MAX_PACKET],
     tx: [u8; MAX_PACKET],
+    iso: [u8; ISO],
 }
 
-impl Buffers {
+impl<const ISO: usize> Buffers<ISO> {
     pub const fn new() -> Self {
         Self {
             rx: [0; MAX_PACKET],
             tx: [0; MAX_PACKET],
+            iso: [0; ISO],
         }
     }
+}
+
+/// The isochronous IN pipe's counters since it was allocated.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct IsoStats {
+    /// packets received
+    pub packets: u32,
+    /// periods whose IN never went out (the bus was still busy at the next one)
+    pub missed: u32,
+    /// packets dropped on a full ring
+    pub overruns: u32,
+    /// INs without a valid answer (no response, a handshake, babble)
+    pub errors: u32,
+}
+
+/// The isochronous IN pipe's counters.
+pub fn iso_in_stats() -> IsoStats {
+    IsoStats {
+        packets: ISO_PACKETS.load(Ordering::Relaxed),
+        missed: ISO_MISSED.load(Ordering::Relaxed),
+        overruns: ISO_OVERRUNS.load(Ordering::Relaxed),
+        errors: ISO_ERRORS.load(Ordering::Relaxed),
+    }
+}
+
+fn count(c: &AtomicU32) {
+    c.store(c.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
 }
 
 pub struct InterruptHandler<T: Instance> {
@@ -131,21 +217,129 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             r.int_fg().write(|w| w.set_fifo_ov(true));
             OVERFLOW.store(true, Ordering::Release);
         }
+        // the transaction before the SOF: an IN that completes in the same entry frees the
+        // SIE for the next period's
         if flag.transfer() {
             let st = r.int_st().read();
             let len = r.rx_len().read();
             // stop the token before the release: with INT_BUSY the SIE waits for the flag
             h.ep_pid().write_value(UhEpPid::default());
             r.int_fg().write(|w| w.set_transfer(true));
-            if IN_FLIGHT.load(Ordering::Relaxed) {
-                IN_FLIGHT.store(false, Ordering::Relaxed);
-                RESULT_ST.store(st.0, Ordering::Relaxed);
-                RESULT_LEN.store(len, Ordering::Relaxed);
-                DONE.store(true, Ordering::Release);
-                XFER_WAKER.wake();
+            match ENGINE.load(Ordering::Relaxed) {
+                ASYNC => {
+                    RESULT_ST.store(st.0, Ordering::Relaxed);
+                    RESULT_LEN.store(len, Ordering::Relaxed);
+                    DONE.store(true, Ordering::Release);
+                    XFER_WAKER.wake();
+                }
+                ISO => iso_complete::<T>(st, len),
+                _ => {}
+            }
+            ENGINE.store(IDLE, Ordering::Relaxed);
+            if !iso_start_if_due::<T>() {
+                ENGINE_WAKER.wake();
             }
         }
+        if flag.hst_sof() {
+            r.int_fg().write(|w| w.set_hst_sof(true));
+            iso_on_sof::<T>();
+        }
     }
+}
+
+/// A SOF: the iso IN is due once per period.
+fn iso_on_sof<T: Instance>() {
+    if !ISO_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let left = ISO_COUNTDOWN.load(Ordering::Relaxed);
+    if left > 1 {
+        ISO_COUNTDOWN.store(left - 1, Ordering::Relaxed);
+        return;
+    }
+    ISO_COUNTDOWN.store(ISO_PERIOD.load(Ordering::Relaxed), Ordering::Relaxed);
+    if ISO_DUE.load(Ordering::Relaxed) {
+        // the last period's IN never got the bus; this one replaces it
+        count(&ISO_MISSED);
+    }
+    ISO_DUE.store(true, Ordering::Relaxed);
+    iso_start_if_due::<T>();
+}
+
+/// Start the iso IN if one is due and the SIE is idle. Interrupt or critical section.
+fn iso_start_if_due<T: Instance>() -> bool {
+    if !ISO_ACTIVE.load(Ordering::Relaxed)
+        || !ISO_DUE.load(Ordering::Relaxed)
+        || ENGINE.load(Ordering::Relaxed) != IDLE
+    {
+        return false;
+    }
+    let r = T::regs();
+    let h = T::hregs();
+    let slots = ISO_SLOTS.load(Ordering::Relaxed);
+    let head = ISO_HEAD.load(Ordering::Relaxed);
+    let tail = ISO_TAIL.load(Ordering::Acquire);
+    // the IN goes out anyway (the device's period is the device's), into the free head slot
+    ISO_DROP.store(head.wrapping_sub(tail) >= slots - 1, Ordering::Relaxed);
+    let slot = iso_slot(head);
+
+    h.dev_ad().write(|w| w.set_addr(ISO_ADDR.load(Ordering::Relaxed)));
+    h.rx_max_len().write(|w| w.set_len(ISO_MPS.load(Ordering::Relaxed)));
+    h.rx_dma().write_value(slot + ISO_HEADER as u32);
+    h.ep_type().write(|w| w.set_h_rx_type(true));
+    h.rx_ctrl().write(|w| w.set_r_tog(Tog::DATA0));
+    OVERFLOW.store(false, Ordering::Relaxed);
+    ISO_DUE.store(false, Ordering::Relaxed);
+    ENGINE.store(ISO, Ordering::Relaxed);
+    h.ep_pid().write(|w| {
+        w.set_token(PID_IN);
+        w.set_endp(ISO_EP.load(Ordering::Relaxed));
+    });
+    r.int_fg().write(|w| w.set_transfer(true));
+    true
+}
+
+fn iso_slot(i: u8) -> u32 {
+    let slots = ISO_SLOTS.load(Ordering::Relaxed);
+    ISO_RING.load(Ordering::Relaxed) + (i & (slots - 1)) as u32 * ISO_STRIDE.load(Ordering::Relaxed) as u32
+}
+
+/// The iso IN's answer: a data packet into the ring.
+fn iso_complete<T: Instance>(st: IntSt, len: u16) {
+    if !ISO_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    if !matches!(st.h_res(), PID_DATA0 | PID_DATA1 | PID_DATA2 | PID_MDATA)
+        || OVERFLOW.load(Ordering::Relaxed)
+        || len > ISO_MPS.load(Ordering::Relaxed)
+    {
+        count(&ISO_ERRORS);
+        return;
+    }
+    if ISO_DROP.load(Ordering::Relaxed) {
+        count(&ISO_OVERRUNS);
+        return;
+    }
+    let head = ISO_HEAD.load(Ordering::Relaxed);
+    let frame = T::regs().frame_no().read().frame_no();
+    // SAFETY: the head slot is the producer's (this interrupt) until head moves
+    unsafe {
+        let p = iso_slot(head) as *mut u16;
+        p.write_volatile(len);
+        p.add(1).write_volatile(frame);
+    }
+    ISO_HEAD.store(head.wrapping_add(1), Ordering::Release);
+    count(&ISO_PACKETS);
+    ISO_WAKER.wake();
+}
+
+/// Stop the iso IN pipe (dropped, or the device went).
+fn iso_stop() {
+    critical_section::with(|_| {
+        ISO_ACTIVE.store(false, Ordering::Relaxed);
+        ISO_DUE.store(false, Ordering::Relaxed);
+    });
+    ISO_WAKER.wake();
 }
 
 fn attached<T: Instance>() -> bool {
@@ -154,7 +348,9 @@ fn attached<T: Instance>() -> bool {
 
 fn bump_generation() {
     GENERATION.store(GENERATION.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    iso_stop();
     XFER_WAKER.wake();
+    ENGINE_WAKER.wake();
 }
 
 pub struct Driver<'d, T: Instance> {
@@ -163,12 +359,12 @@ pub struct Driver<'d, T: Instance> {
 }
 
 impl<'d, T: Instance> Driver<'d, T> {
-    pub fn new(
+    pub fn new<const ISO: usize>(
         _peri: Peri<'d, T>,
         _irq: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>> + 'd,
         dp: Peri<'d, impl DpPin<T, 0>>,
         dm: Peri<'d, impl DmPin<T, 0>>,
-        buffers: &'d mut Buffers,
+        buffers: &'d mut Buffers<ISO>,
     ) -> Self {
         dp.set_as_af_output(AFType::OutputPushPull, PinSpeed::High);
         dm.set_as_af_output(AFType::OutputPushPull, PinSpeed::High);
@@ -201,7 +397,7 @@ impl<'d, T: Instance> Driver<'d, T> {
             w.set_h_tx_en(true);
             w.set_h_rx_en(true);
         });
-        h.ep_type().write_value(Default::default());
+        h.ep_type().write_value(UhEpType::default());
         h.rx_max_len().write(|w| w.set_len(MAX_PACKET as u16));
 
         let rx = buffers.rx.as_mut_ptr() as u32;
@@ -210,8 +406,11 @@ impl<'d, T: Instance> Driver<'d, T> {
         h.tx_dma().write_value(tx);
         RX_BUF.store(rx, Ordering::Relaxed);
         TX_BUF.store(tx, Ordering::Relaxed);
+        ISO_RING.store(buffers.iso.as_mut_ptr() as u32, Ordering::Relaxed);
+        ISO_RING_LEN.store(ISO as u32, Ordering::Relaxed);
+        ISO_ALLOCATED.store(false, Ordering::Relaxed);
 
-        IN_FLIGHT.store(false, Ordering::Relaxed);
+        ENGINE.store(IDLE, Ordering::Relaxed);
         DETECTED.store(false, Ordering::Relaxed);
         bump_generation();
 
@@ -227,6 +426,7 @@ impl<'d, T: Instance> Driver<'d, T> {
             w.set_detect(true);
             w.set_transfer(true);
             w.set_fifo_ov(true);
+            w.set_sof_act(true);
         });
         T::Interrupt::unpend();
         unsafe { T::Interrupt::enable() };
@@ -295,6 +495,7 @@ impl<'d, T: Instance> UsbHostController<'d> for Driver<'d, T> {
         let r = T::regs();
         let h = T::hregs();
 
+        iso_stop();
         r.dev_ad().write(|w| w.set_addr(0));
         r.ctrl().modify(|w| w.set_speed_type(SpeedType::HIGHSPEED));
         h.ctrl().modify(|w| w.set_tx_bus_reset(true));
@@ -339,11 +540,15 @@ impl<'d, T: Instance> UsbHostAllocator<'d> for Allocator<'d, T> {
         if split.is_some() {
             return Err(HostError::Other("usbhs host: no split transactions"));
         }
-        if E::ep_type() == EndpointType::Isochronous {
-            return Err(HostError::Other("usbhs host: no isochronous pipes yet"));
-        }
-        if endpoint.max_packet_size == 0 || endpoint.max_packet_size as usize > MAX_PACKET {
+        let iso = E::ep_type() == EndpointType::Isochronous;
+        let limit = if iso { MAX_ISO_PACKET } else { MAX_PACKET };
+        // high bandwidth (wMaxPacketSize bits 12:11) is over the limit too
+        if endpoint.max_packet_size == 0 || endpoint.max_packet_size as usize > limit {
             return Err(HostError::InvalidDescriptor);
+        }
+        let generation = GENERATION.load(Ordering::Relaxed);
+        if iso {
+            iso_alloc(addr, endpoint, D::is_out())?;
         }
         Ok(Pipe {
             _phantom: PhantomData,
@@ -351,9 +556,10 @@ impl<'d, T: Instance> UsbHostAllocator<'d> for Allocator<'d, T> {
                 addr,
                 ep: endpoint.addr.index() as u8,
                 max_packet_size: endpoint.max_packet_size,
-                generation: GENERATION.load(Ordering::Relaxed),
+                generation,
             },
             interval_ms: endpoint.interval_ms,
+            iso,
             tog: false,
             timeout: TimeoutConfig::default(),
         })
@@ -363,6 +569,40 @@ impl<'d, T: Instance> UsbHostAllocator<'d> for Allocator<'d, T> {
         // one device: whichever it was, its pipes go
         bump_generation();
     }
+}
+
+/// Claim the isochronous IN pipe and lay out its ring.
+fn iso_alloc(addr: u8, endpoint: &EndpointInfo, out: bool) -> Result<(), HostError> {
+    if out {
+        return Err(HostError::Other("usbhs host: no isochronous OUT"));
+    }
+    let stride = ISO_HEADER + (endpoint.max_packet_size as usize).next_multiple_of(4);
+    let fit = ISO_RING_LEN.load(Ordering::Relaxed) as usize / stride;
+    if fit < 2 {
+        return Err(HostError::InsufficientMemory);
+    }
+    // a power of two: the wrapping u8 indices stay continuous
+    let slots = 1 << (usize::BITS - 1 - fit.min(ISO_MAX_SLOTS).leading_zeros());
+    // bInterval: 2^(n-1) (micro)frames
+    let period = 1u8 << (endpoint.interval_ms.clamp(1, 8) - 1);
+    critical_section::with(|_| {
+        if ISO_ALLOCATED.load(Ordering::Relaxed) {
+            return Err(HostError::OutOfPipes);
+        }
+        ISO_ALLOCATED.store(true, Ordering::Relaxed);
+        ISO_ACTIVE.store(false, Ordering::Relaxed);
+        ISO_DUE.store(false, Ordering::Relaxed);
+        ISO_ADDR.store(addr, Ordering::Relaxed);
+        ISO_EP.store(endpoint.addr.index() as u8, Ordering::Relaxed);
+        ISO_MPS.store(endpoint.max_packet_size, Ordering::Relaxed);
+        ISO_PERIOD.store(period, Ordering::Relaxed);
+        ISO_STRIDE.store(stride as u16, Ordering::Relaxed);
+        ISO_SLOTS.store(slots as u8, Ordering::Relaxed);
+        for c in [&ISO_PACKETS, &ISO_MISSED, &ISO_OVERRUNS, &ISO_ERRORS] {
+            c.store(0, Ordering::Relaxed);
+        }
+        Ok(())
+    })
 }
 
 /// Where a pipe's transactions go.
@@ -385,28 +625,10 @@ enum Outcome {
     ToggleMismatch,
 }
 
-/// Stops a token that is still on the bus when the transaction is dropped or timed out.
+/// Stops a task's token that is still on the bus when the transaction is dropped or timed
+/// out.
 struct InFlight<T: Instance> {
     _phantom: PhantomData<T>,
-}
-
-impl<T: Instance> InFlight<T> {
-    fn start(pid: u8, ep: u8) -> Self {
-        let r = T::regs();
-        let h = T::hregs();
-        critical_section::with(|_| {
-            DONE.store(false, Ordering::Relaxed);
-            OVERFLOW.store(false, Ordering::Relaxed);
-            IN_FLIGHT.store(true, Ordering::Relaxed);
-            // WCH's order: the token, then the flag release
-            h.ep_pid().write(|w| {
-                w.set_token(pid);
-                w.set_endp(ep);
-            });
-            r.int_fg().write(|w| w.set_transfer(true));
-        });
-        Self { _phantom: PhantomData }
-    }
 }
 
 impl<T: Instance> Drop for InFlight<T> {
@@ -414,16 +636,17 @@ impl<T: Instance> Drop for InFlight<T> {
         let r = T::regs();
         let h = T::hregs();
         critical_section::with(|_| {
-            if !IN_FLIGHT.load(Ordering::Relaxed) {
+            if ENGINE.load(Ordering::Relaxed) != ASYNC {
                 return;
             }
-            IN_FLIGHT.store(false, Ordering::Relaxed);
             h.ep_pid().write_value(UhEpPid::default());
             let mut n = 0;
             while !r.mis_st().read().sie_free() && n < SIE_WAIT {
                 n += 1;
             }
             r.int_fg().write(|w| w.set_transfer(true));
+            ENGINE.store(IDLE, Ordering::Relaxed);
+            iso_start_if_due::<T>();
         });
     }
 }
@@ -445,20 +668,44 @@ async fn transaction<T: Instance>(
     }
 
     if !out.is_empty() {
-        // SAFETY: the TX buffer is MAX_PACKET long and the DMA is idle (the lock)
+        // SAFETY: the TX buffer is MAX_PACKET long and only the task holding the lock uses it
         unsafe {
             core::ptr::copy_nonoverlapping(out.as_ptr(), TX_BUF.load(Ordering::Relaxed) as *mut u8, out.len());
         }
     }
     let tog = if tog { Tog::DATA1 } else { Tog::DATA0 };
-    h.dev_ad().write(|w| w.set_addr(t.addr));
-    h.rx_max_len().write(|w| w.set_len(t.max_packet_size));
-    h.tx_len().write(|w| w.set_len(out.len() as u16));
-    h.tx_ctrl().write(|w| w.set_t_tog(tog));
-    h.rx_ctrl().write(|w| w.set_r_tog(tog));
     compiler_fence(Ordering::SeqCst);
 
-    let in_flight = InFlight::<T>::start(pid, t.ep);
+    // the SIE once it's idle and no iso IN is due; the registers in the same critical
+    // section, as the interrupt sets them for the iso IN
+    let in_flight = poll_fn(|cx| {
+        critical_section::with(|_| {
+            let due = ISO_ACTIVE.load(Ordering::Relaxed) && ISO_DUE.load(Ordering::Relaxed);
+            if ENGINE.load(Ordering::Relaxed) != IDLE || due {
+                ENGINE_WAKER.register(cx.waker());
+                return Poll::Pending;
+            }
+            h.dev_ad().write(|w| w.set_addr(t.addr));
+            h.rx_max_len().write(|w| w.set_len(t.max_packet_size));
+            h.rx_dma().write_value(RX_BUF.load(Ordering::Relaxed));
+            h.ep_type().write_value(UhEpType::default());
+            h.tx_len().write(|w| w.set_len(out.len() as u16));
+            h.tx_ctrl().write(|w| w.set_t_tog(tog));
+            h.rx_ctrl().write(|w| w.set_r_tog(tog));
+            DONE.store(false, Ordering::Relaxed);
+            OVERFLOW.store(false, Ordering::Relaxed);
+            ENGINE.store(ASYNC, Ordering::Relaxed);
+            // WCH's order: the token, then the flag release
+            h.ep_pid().write(|w| {
+                w.set_token(pid);
+                w.set_endp(t.ep);
+            });
+            T::regs().int_fg().write(|w| w.set_transfer(true));
+            Poll::Ready(InFlight::<T> { _phantom: PhantomData })
+        })
+    })
+    .await;
+
     let done = embassy_time::with_timeout(
         TRANSACTION_TIMEOUT,
         poll_fn(|cx| {
@@ -490,8 +737,8 @@ async fn transaction<T: Instance>(
             if len > rx.len() {
                 return Err(PipeError::BufferOverflow);
             }
-            // SAFETY: the RX buffer holds `len` <= MAX_PACKET bytes from the DMA, which
-            // is idle (the lock)
+            // SAFETY: the RX buffer holds `len` <= MAX_PACKET bytes from the DMA; only the
+            // task holding the lock uses it
             unsafe {
                 core::ptr::copy_nonoverlapping(RX_BUF.load(Ordering::Relaxed) as *const u8, rx.as_mut_ptr(), len);
             }
@@ -513,6 +760,47 @@ async fn transaction<T: Instance>(
         0 => Ok(Outcome::NoResponse),
         _ => Err(PipeError::BadResponse),
     }
+}
+
+/// The next packet from the isochronous IN ring, arming the pipe on the first call.
+async fn iso_read<T: Instance>(generation: u8, buf: &mut [u8]) -> Result<usize, PipeError> {
+    let gone = || GENERATION.load(Ordering::Relaxed) != generation || !attached::<T>();
+    if gone() {
+        return Err(PipeError::Disconnected);
+    }
+    critical_section::with(|_| {
+        if !ISO_ACTIVE.load(Ordering::Relaxed) {
+            ISO_HEAD.store(0, Ordering::Relaxed);
+            ISO_TAIL.store(0, Ordering::Relaxed);
+            ISO_COUNTDOWN.store(1, Ordering::Relaxed);
+            ISO_DUE.store(false, Ordering::Relaxed);
+            ISO_ACTIVE.store(true, Ordering::Relaxed);
+        }
+    });
+    poll_fn(|cx| {
+        ISO_WAKER.register(cx.waker());
+        let tail = ISO_TAIL.load(Ordering::Relaxed);
+        if ISO_HEAD.load(Ordering::Acquire) != tail {
+            let slot = iso_slot(tail);
+            // SAFETY: a slot in [tail, head): the interrupt is done with it until tail moves
+            let len = unsafe { (slot as *const u16).read_volatile() } as usize;
+            let r = if len > buf.len() {
+                Err(PipeError::BufferOverflow)
+            } else {
+                unsafe {
+                    core::ptr::copy_nonoverlapping((slot as usize + ISO_HEADER) as *const u8, buf.as_mut_ptr(), len);
+                }
+                Ok(len)
+            };
+            ISO_TAIL.store(tail.wrapping_add(1), Ordering::Release);
+            return Poll::Ready(r);
+        }
+        if gone() || !ISO_ACTIVE.load(Ordering::Relaxed) {
+            return Poll::Ready(Err(PipeError::Disconnected));
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 /// What a NAK means for the transfer
@@ -549,9 +837,20 @@ pub struct Pipe<'d, T: Instance, E, D> {
     _phantom: PhantomData<(&'d T, fn() -> (E, D))>,
     target: Target,
     interval_ms: u8,
+    /// the isochronous IN pipe (owns the ring)
+    iso: bool,
     /// the next bulk / interrupt packet's toggle (DATA1: true)
     tog: bool,
     timeout: TimeoutConfig,
+}
+
+impl<'d, T: Instance, E, D> Drop for Pipe<'d, T, E, D> {
+    fn drop(&mut self) {
+        if self.iso {
+            iso_stop();
+            ISO_ALLOCATED.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 impl<'d, T: Instance, E: pipe::Type, D: pipe::Direction> Pipe<'d, T, E, D> {
@@ -659,6 +958,9 @@ impl<'d, T: Instance, E: pipe::Type, D: pipe::Direction> UsbPipe<E, D> for Pipe<
     where
         D: pipe::IsIn,
     {
+        if self.iso {
+            return iso_read::<T>(self.target.generation, buf).await;
+        }
         let nak = self.nak_retry();
         let mps = self.target.max_packet_size as usize;
         let mut n = 0;
