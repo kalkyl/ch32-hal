@@ -17,8 +17,8 @@ use core::task::Poll;
 use embedded_hal::spi::Mode;
 
 use super::{BitOrder, CsPin, Instance, MisoPin, MosiPin, RxDma, SckPin, TxDma, Word};
-use crate::dma::{CircularTransfer, Priority, RingPositionReader};
-use crate::gpio::{AFType, AnyPin, Pull, SealedPin, Speed};
+use crate::dma::{CircularTransfer, Priority, Request, RingPositionReader};
+use crate::gpio::{AfType, AnyPin, OutputType, Pull, SealedPin, Speed};
 use crate::Peri;
 
 /// Slave configuration. The clock comes from the master.
@@ -82,6 +82,8 @@ pub struct SpiSlaveRing<'d, T: Instance, W: Word> {
     _miso: Peri<'d, AnyPin>,
     rx: CircularTransfer<'d>,
     tx: CircularTransfer<'d>,
+    rx_request: Request,
+    tx_request: Request,
     rx_buf: *mut [W],
     tx_buf: *mut [W],
     half_len: usize,
@@ -98,12 +100,12 @@ impl<'d, T: Instance, W: Word> SpiSlaveRing<'d, T, W> {
     /// `rx_buf` and `tx_buf` are the same length; each pass uses 2 x `half_len` words of
     /// them (all of them by default). Nothing runs until [`start`](Self::start).
     #[allow(clippy::too_many_arguments)]
-    pub fn new<const REMAP: u8>(
+    pub fn new<#[cfg(not(afio_h4))] const REMAP: u8>(
         peri: Peri<'d, T>,
-        sck: Peri<'d, impl SckPin<T, REMAP>>,
-        mosi: Peri<'d, impl MosiPin<T, REMAP>>,
-        miso: Peri<'d, impl MisoPin<T, REMAP>>,
-        nss: Peri<'d, impl CsPin<T, REMAP>>,
+        sck: Peri<'d, if_remap!(impl SckPin<T, REMAP>)>,
+        mosi: Peri<'d, if_remap!(impl MosiPin<T, REMAP>)>,
+        miso: Peri<'d, if_remap!(impl MisoPin<T, REMAP>)>,
+        nss: Peri<'d, if_remap!(impl CsPin<T, REMAP>)>,
         rx_dma: Peri<'d, impl RxDma<T>>,
         tx_dma: Peri<'d, impl TxDma<T>>,
         rx_buf: &'d mut [W],
@@ -111,13 +113,13 @@ impl<'d, T: Instance, W: Word> SpiSlaveRing<'d, T, W> {
         config: SlaveConfig,
     ) -> Self {
         assert!(rx_buf.len() == tx_buf.len() && rx_buf.len() >= 2 && rx_buf.len() <= 0xFFFF);
-        T::set_remap(REMAP);
+        apply_remap!();
 
         // master-driven inputs; NSS pulled high so an unpowered master reads as a pause
-        sck.set_as_input(Pull::None);
-        mosi.set_as_input(Pull::None);
-        nss.set_as_input(Pull::Up);
-        miso.set_as_af_output(AFType::OutputPushPull, Speed::High);
+        set_as_af!(sck, AfType::input(Pull::None));
+        set_as_af!(mosi, AfType::input(Pull::None));
+        set_as_af!(nss, AfType::input(Pull::Up));
+        set_as_af!(miso, AfType::output(OutputType::PushPull, Speed::High));
 
         let half_len = rx_buf.len() / 2;
         Self {
@@ -126,6 +128,8 @@ impl<'d, T: Instance, W: Word> SpiSlaveRing<'d, T, W> {
             _sck: sck.into(),
             _mosi: mosi.into(),
             _miso: miso.into(),
+            rx_request: rx_dma.request(),
+            tx_request: tx_dma.request(),
             rx: CircularTransfer::new(rx_dma),
             tx: CircularTransfer::new(tx_dma),
             rx_buf,
@@ -170,8 +174,10 @@ impl<'d, T: Instance, W: Word> SpiSlaveRing<'d, T, W> {
         unsafe {
             let rx = core::ptr::slice_from_raw_parts_mut(self.rx_buf as *mut W, n);
             let tx = core::ptr::slice_from_raw_parts(self.tx_buf as *const W, n);
-            self.rx.configure_read((), dr, rx, self.config.priority, true);
-            self.tx.configure_write((), tx, dr, self.config.priority, false);
+            self.rx
+                .configure_read(self.rx_request, dr, rx, self.config.priority, true);
+            self.tx
+                .configure_write(self.tx_request, tx, dr, self.config.priority, false);
         }
         self.delivered = 0;
 
