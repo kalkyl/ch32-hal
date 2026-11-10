@@ -1064,6 +1064,7 @@ impl<'a, W: Word> Drop for WritableRingBuffer<'a, W> {
 
 // ==============================
 
+#[cfg(not(dma_v4x7))]
 fn remaining(r: pac::dma::Dma, num: usize) -> usize {
     #[cfg(not(ch32h4))]
     return r.ch(num).ndtr().read().ndt() as usize;
@@ -1071,6 +1072,7 @@ fn remaining(r: pac::dma::Dma, num: usize) -> usize {
     return r.ch(num).cntr().read().ndt() as usize;
 }
 
+#[cfg(not(dma_v4x7))]
 fn tcif(r: pac::dma::Dma, num: usize) -> bool {
     #[cfg(not(ch32h4))]
     return r.isr().read().tcif(num);
@@ -1078,6 +1080,7 @@ fn tcif(r: pac::dma::Dma, num: usize) -> bool {
     return r.intfr().read().tcif(num);
 }
 
+#[cfg(not(dma_v4x7))]
 /// Where a circular transfer is: whole passes over the buffer, and the index of the next
 /// element the DMA moves.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -1091,6 +1094,7 @@ pub struct RingPosition {
     pub index: usize,
 }
 
+#[cfg(not(dma_v4x7))]
 /// Reads a circular transfer's [`RingPosition`] from anywhere, e.g. another interrupt
 /// handler, without owning the transfer.
 #[derive(Copy, Clone)]
@@ -1099,6 +1103,7 @@ pub struct RingPositionReader {
     len: u16,
 }
 
+#[cfg(not(dma_v4x7))]
 impl RingPositionReader {
     /// The transfer's current position. Consistent even when called from an interrupt
     /// that preempts the DMA interrupt, or while the DMA wraps around.
@@ -1132,6 +1137,7 @@ impl RingPositionReader {
     }
 }
 
+#[cfg(not(dma_v4x7))]
 /// A circular DMA transfer over a buffer the owner reads or writes in place (no copy),
 /// typically in halves: the half and complete interrupts wake the registered waker.
 ///
@@ -1142,6 +1148,7 @@ pub struct CircularTransfer<'a> {
     len: u16,
 }
 
+#[cfg(not(dma_v4x7))]
 impl<'a> CircularTransfer<'a> {
     /// Take a channel; [`configure_read`](Self::configure_read) /
     /// [`configure_write`](Self::configure_write) set the transfer up.
@@ -1283,6 +1290,7 @@ impl<'a> CircularTransfer<'a> {
     }
 }
 
+#[cfg(not(dma_v4x7))]
 impl<'a> Drop for CircularTransfer<'a> {
     fn drop(&mut self) {
         self.stop();

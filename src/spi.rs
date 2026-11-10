@@ -43,7 +43,10 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
     }
 }
 
+// the ring runs on the BDMA-style channels' circular transfers
+#[cfg(not(dma_v4x7))]
 mod slave;
+#[cfg(not(dma_v4x7))]
 pub use slave::{Half, SlaveConfig, SlaveError, SpiSlaveRing};
 
 /// SPI Error
