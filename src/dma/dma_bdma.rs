@@ -1137,18 +1137,18 @@ impl RingPositionReader {
     }
 }
 
-#[cfg(not(dma_v4x7))]
+#[cfg(all(spi, not(dma_v4x7)))]
 /// A circular DMA transfer over a buffer the owner reads or writes in place (no copy),
 /// typically in halves: the half and complete interrupts wake the registered waker.
 ///
 /// A transfer error doesn't panic: the channel stops and [`take_error`](Self::take_error)
 /// reports it, so the owner can restart.
-pub struct CircularTransfer<'a> {
+pub(crate) struct CircularTransfer<'a> {
     channel: Peri<'a, AnyChannel>,
     len: u16,
 }
 
-#[cfg(not(dma_v4x7))]
+#[cfg(all(spi, not(dma_v4x7)))]
 impl<'a> CircularTransfer<'a> {
     /// Take a channel; [`configure_read`](Self::configure_read) /
     /// [`configure_write`](Self::configure_write) set the transfer up.
@@ -1268,11 +1268,6 @@ impl<'a> CircularTransfer<'a> {
         }
     }
 
-    /// Elements per pass.
-    pub fn len(&self) -> usize {
-        self.len as usize
-    }
-
     /// Whether a transfer error stopped the channel since the last call (or configure).
     pub fn take_error(&self) -> bool {
         // no atomic swap on every target
@@ -1290,7 +1285,7 @@ impl<'a> CircularTransfer<'a> {
     }
 }
 
-#[cfg(not(dma_v4x7))]
+#[cfg(all(spi, not(dma_v4x7)))]
 impl<'a> Drop for CircularTransfer<'a> {
     fn drop(&mut self) {
         self.stop();
