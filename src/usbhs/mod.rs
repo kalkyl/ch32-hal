@@ -1009,10 +1009,9 @@ impl<'d, T: Instance, const NR_EP: usize, const SIZE: usize> Driver<'d, T, NR_EP
 
         let s = state(addr);
         s.iso.store(iso, Ordering::Relaxed);
-        // one packet per microframe (the only rate the SOF catch-up handles): the descriptor's
-        // bInterval is 1 at high speed, but 0 is accepted as "every microframe" by drivers that
-        // pass it through
-        if iso && dir == Direction::In && interval_ms <= 1 {
+        // one packet per microframe (the only rate the SOF catch-up handles): embassy-usb's
+        // interval 0. 1 is 1 ms, every 8th microframe at high speed (a UAC2 feedback endpoint)
+        if iso && dir == Direction::In && interval_ms == 0 {
             ISO_IN_EVERY.store(
                 ISO_IN_EVERY.load(Ordering::Relaxed) | 1 << addr.index(),
                 Ordering::Relaxed,
